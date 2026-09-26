@@ -19,7 +19,17 @@
   一次性探针**用完即弃**；旧的 62 个归档在 `outputs/tools-探针归档-2026-09-26.zip`。
   要删探针，判据是「**活文件**（`app/` `tests/` `tools/` 技能 `MEMORY.md` 说明书）有没有引用」——
   **历史日志里提到过不算理由**；`_bench_reparse.py` 依赖 `_bench_perf.build_document`，两个得一起留。
-- 无 git 仓库——回退验证靠临时改代码 + `# TEMP-REVERT-CHECK` 标记，改完数残留。
+- **有 git 仓库了**（2026-09-26 建，分支 `main`，首个提交 `8f63f1e`，64 个文件）——回退直接
+  `git checkout -- <文件>` / `git revert`，不用再靠临时改代码数残留。仓库级配置
+  `core.autocrlf=false`（行尾原样存）、`core.quotepath=false`（中文路径不转义）；
+  身份是占位值 `JianJi <jianji@localhost>`（**仅本仓库**，全局没配）。
+  已忽略 `outputs/`（~12MB 长图与核验截图，可重生成；只跟踪 `tools-探针归档-2026-09-26.zip`）、
+  `.idea/`、`__pycache__/`。
+- **行尾实测**（建仓时逐文件量的，**别按印象写脚本**）：绝大多数是 **LF**；CRLF 的只有
+  `app/image_export.py`、`tools/_probe_editor_wrap.py` 和 `.workbuddy-ai/memory/` 下的
+  `MEMORY.md` / `09-22` / `09-23` / `09-25` / `09-26`——其中 `2026-09-22.md` 是**单文件内混用**
+  （62 CRLF + 48 LF）。`09-09` / `09-13` / `09-20` / `09-21` / `09-24` 是 LF。
+  「日志都是 CRLF」是错的。`core.autocrlf=false` 保证 git 不做任何转换（已验证磁盘与 blob 逐字节相同）。
 
 ## 核验必须在**用户真实设置**下做（踩得很惨）
 
