@@ -9,6 +9,22 @@
   **不写工程根目录**（根目录 `.md` 会让文件夹树混进 `app`/`tools`/`tests`）。
 - **使用说明每次更新都同步到 `C:\Users\22910\Documents\wb01\说明书\` 并重出长图**（用户固定要求）：
   `python tools/quiet_desktop.py <python 全路径> tools/_sync_manual.py`。
+- **`简记使用说明.md` 是测试基准文件，不是普通文档**：`tests/test_export.py::EditorParityTests`
+  拿它整篇做「编辑器 vs 导出」逐行对账，并断言它**覆盖全部 10 种块级语法**
+  （`heading/text/blank/bullet/ordered/task/quote/code/hr/table`）。重写它必须保留这 10 种。
+  `hr` 靠章节之间那些 `---`，**前面必须有空行**（紧贴正文会变成 setext 标题）。
+- **写 `.md` 给这个应用渲染时，一段话必须写成一行。** 编辑器和导出都**按源行分块**
+  （只有**行首缩进**的续行会被并进上一段），手工断行会让每行各自成块 ——
+  长图里就出现「写成 `2. `，」这种只剩半行的残句。**引用同理**：连续两行 `> xxx` 会裂成
+  两个引用块（中间一道缝），除非第一行以**行尾两个空格**结尾。
+- **表格里别放超长单元格**：`_layout_table` 在 `total > content_width` 时**等比压缩**，
+  下限是**写死的** `floor = body_size * 2.2`，不是「本列最长不可断词宽度」——
+  长格会把整表压窄，逼得另一列的长 token 从中间断开（实测 `Ctrl+Shift+F` → `Ctrl+Shi`/`ft+F`）。
+  绕开办法是把那一格移出表格改成表下一行说明。**别去改 `_measure` / `char_widths`**：
+  实测整串宽度与逐字之和差 0，不是它们的问题。
+- **`python` 走 PATH 是托管 3.13，没有 tkinter**（`import tkinter` 直接
+  `ModuleNotFoundError`）。跑测试/同步一律用**系统 3.12 全路径**：
+  `C:\Users\22910\AppData\Local\Programs\Python\Python312\python.exe`。
 - 运行 `run_jianji.cmd` / `python app/main.py`（系统 Python 3.12，无第三方依赖）。
 - 测试 `python tools/run_tests.py`（**默认隐藏桌面**；`--foreground` 才回当前桌面，**截原生菜单必须用它**；
   `-k` 按文件名过滤）。输出落 `outputs/test-output.txt`，屏幕只摘 `FAIL:`/`ERROR:`/`Ran`/`OK`；**0 用例 = 退出码 3**。
