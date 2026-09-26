@@ -1,0 +1,19 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+
+# ---- IDE ----
+# 整个 .idea/ 不入库：里面是这台机器上的解释器路径和窗口布局，换台机器就没意义
+# （IntelliJ 自己也在 .idea/.gitignore 里排掉了 workspace.xml）。
+.idea/
+
+# ---- 运行产物 / 核验截图 ----
+# outputs/ 里是长图、核验截图、测试输出，一共约 12MB，全都能用 tools/ 里的脚本重新生成。
+# 只跟踪「一次性备份」那一个 zip，其余不入库。
+# 注意 git 的规则：**父目录被排除时 `!` 反排除无效**，所以先写 `outputs/*` 而不是 `outputs/`。
+outputs/*
+!outputs/tools-探针归档-2026-09-26.zip
+
+# ---- Windows ----
+Thumbs.db
+desktop.ini
