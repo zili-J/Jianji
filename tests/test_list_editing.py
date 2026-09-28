@@ -285,5 +285,187 @@ class EmptyOrderedItemCaretTests(OrderedListReturnTests):
                         "光标不该在第一次按键时大幅跳动")
 
 
+@unittest.skipUnless(HAS_DISPLAY, "需要图形界面环境")
+class ListIndentKeyTests(OrderedListReturnTests):
+    """Tab / Shift+Tab 调列表层级。
+
+    用户要求：「有序列表增加层级至4级」。实测层级模型本来就到 4 层（`LIST_MAX_LEVEL`），
+    真正缺的是**没法缩进**——Tab 一个键都没绑，只能手敲空格。这一组用例守住三件事：
+
+    ① 缩进/反缩进真的改变层级，且夹在 0..4 之间；
+    ② **绝不插制表符**——`_indent_level` 把一个 `\\t` 算成四格 = 两层，插了就会跳层；
+    ③ 反缩进到底**不删记号**（删了就是把列表项改成正文，属于内容改写）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 在 setUp 里取，不在模块级 import main：这个文件在没图形环境时也要能
+        # 被收集（上面那个 HAS_DISPLAY 探针就是为了这个）。
+        import main
+
+        self.max_level = main.LIST_MAX_LEVEL
+
+    def _load_lines(self, text: str, cursor: str = "1.0") -> None:
+        """换正文、放光标，并强制整篇重解析（层级判断依赖 `_doc_blocks`）。"""
+        self._load(text, cursor)
+        self.app._apply_markdown_styles()
+        self.root.update()
+
+    def _level(self, number: int = 1) -> int:
+        return self.app._block_of(number).level
+
+    def _kind(self, number: int = 1) -> str:
+        return self.app._block_of(number).kind
+
+    def _tags(self, number: int = 1) -> list[str]:
+        return [tag for tag in self.app.editor.tag_names(f"{number}.0") if tag != "sel"]
+
+    # ---------- 缩进 ----------
+
+    def test_tab_indents_an_ordered_item(self) -> None:
+        self._load_lines("1. 第一条")
+        self.assertEqual(self._press_tab(), "break")
+        self.assertEqual(self._text(), "  1. 第一条")
+        self.assertEqual(self._level(), 1)
+        self.assertIn("li1", self._tags())
+
+    def test_tab_indents_one_level_at_a_time(self) -> None:
+        self._load_lines("1. 第一条")
+        for expected in (1, 2, 3, 4):
+            self._press_tab()
+            self.assertEqual(self._level(), expected)
+
+    def test_tab_stops_at_the_top_level(self) -> None:
+        self._load_lines(" " * (self.max_level * 2) + "1. 已经最深")
+        self.assertEqual(self._level(), self.max_level)
+        self._press_tab()
+        self.assertEqual(self._level(), self.max_level, "不该超过 LIST_MAX_LEVEL")
+        self.assertEqual(self._text(), " " * (self.max_level * 2) + "1. 已经最深")
+
+    def test_bullets_and_tasks_can_be_indented_too(self) -> None:
+        self._load_lines("- 无序项")
+        self._press_tab()
+        self.assertEqual(self._kind(), "bullet")
+        self.assertEqual(self._level(), 1)
+
+        self._load_lines("- [ ] 任务项")
+        self._press_tab()
+        self.assertEqual(self._kind(), "task")
+        self.assertEqual(self._level(), 1)
+
+    def test_the_caret_keeps_pointing_at_the_same_character(self) -> None:
+        """缩进把行首的空白加宽了，光标应当跟着往右挪，而不是跳回行首。"""
+        # "1. 第一条"：0='1' 1='.' 2=' ' 3='第' —— 光标放到「第」上
+        self._load_lines("1. 第一条", cursor="1.3")
+        before_char = self.app.editor.get("insert")
+        self.assertEqual(before_char, "第")
+        self._press_tab()
+        self.assertEqual(self.app.editor.get("insert"), before_char,
+                         "缩进后光标应当还指着同一个字符")
+        self.assertEqual(self.app.editor.index("insert"), "1.5")
+
+    # ---------- 反缩进 ----------
+
+    def test_shift_tab_outdents(self) -> None:
+        self._load_lines("    1. 第三层")
+        self.assertEqual(self._level(), 2)
+        self.assertEqual(self._press_shift_tab(), "break")
+        self.assertEqual(self._text(), "  1. 第三层")
+        self.assertEqual(self._level(), 1)
+
+    def test_shift_tab_stops_at_zero_and_keeps_the_marker(self) -> None:
+        """到底就不再动，**而且不能把 `1. ` 记号删掉**。"""
+        self._load_lines("1. 第一条")
+        self._press_shift_tab()
+        self.assertEqual(self._text(), "1. 第一条")
+        self.assertEqual(self._level(), 0)
+        self.assertEqual(self._kind(), "ordered", "反缩进不该把列表项变回正文")
+
+    # ---------- 绝不插制表符 ----------
+
+    def test_tab_never_inserts_a_tab_character(self) -> None:
+        """`\\t` 会被 `_indent_level` 算成两层，插了就会跳层。"""
+        self._load_lines("普通正文")
+        self._press_tab()
+        self.assertNotIn("\t", self._text())
+        self.assertEqual(self._text(), "  普通正文")
+
+    def test_a_tab_indented_item_is_normalised_to_spaces(self) -> None:
+        self._load_lines("\t1. 用制表符缩进的项")
+        self.assertEqual(self._level(), 2, "一个 \\t 算四格 = 两层")
+        self._press_tab()
+        self.assertNotIn("\t", self._text())
+        self.assertEqual(self._level(), 3)
+        self.assertEqual(self._text(), " " * 6 + "1. 用制表符缩进的项")
+
+    # ---------- 不接管的情况 ----------
+
+    def test_tab_on_plain_text_inserts_two_spaces(self) -> None:
+        self._load_lines("普通正文", cursor="1.0")
+        self._press_tab()
+        self.assertEqual(self._text(), "  普通正文")
+        self.assertEqual(self._kind(), "text")
+
+    def test_shift_tab_on_plain_text_changes_nothing(self) -> None:
+        self._load_lines("  普通正文")
+        self.assertEqual(self._press_shift_tab(), "break")
+        self.assertEqual(self._text(), "  普通正文")
+
+    # ---------- 多行选区 ----------
+
+    def test_a_selection_indents_every_list_line(self) -> None:
+        self._load_lines("1. 甲\n2. 乙\n3. 丙\n")
+        self.app.editor.tag_add("sel", "1.0", "3.5")
+        self._press_tab()
+        self.assertEqual(self._text(), "  1. 甲\n  2. 乙\n  3. 丙\n")
+        for number in (1, 2, 3):
+            self.assertEqual(self._level(number), 1)
+
+    def test_a_selection_ending_at_a_line_start_does_not_take_that_line(self) -> None:
+        """拖选到下一行**行首**是常见操作，那一行不该被算进来。"""
+        self._load_lines("1. 甲\n2. 乙\n3. 丙\n")
+        self.app.editor.tag_add("sel", "1.0", "3.0")
+        self._press_tab()
+        self.assertEqual(self._text(), "  1. 甲\n  2. 乙\n3. 丙\n")
+        self.assertEqual(self._level(3), 0)
+
+    def test_a_selection_over_plain_text_is_left_alone(self) -> None:
+        self._load_lines("甲\n乙\n丙\n")
+        self.app.editor.tag_add("sel", "1.0", "3.5")
+        self._press_tab()
+        self.assertEqual(self._text(), "甲\n乙\n丙\n", "正文选区不该被空格替掉")
+
+    # ---------- 绑定 ----------
+
+    def test_the_keys_are_actually_bound(self) -> None:
+        for sequence in ("<Tab>", "<Shift-Tab>", "<ISO_Left_Tab>"):
+            script = self.app.editor.bind(sequence)
+            self.assertTrue(script, f"{sequence} 没有绑上处理函数")
+            self.assertIn("_on_editor", script)
+
+    def test_the_handler_asks_tk_to_stop(self) -> None:
+        """必须返回 "break"：Tab 不能落回「插制表符」，Shift+Tab 不能跳走焦点。"""
+        self._load_lines("1. 第一条")
+        self.assertEqual(self._press_tab(), "break")
+        self.assertEqual(self._press_shift_tab(), "break")
+
+    def test_a_plain_line_also_swallows_the_key(self) -> None:
+        self._load_lines("普通正文")
+        self.assertEqual(self._press_tab(), "break")
+        self.assertEqual(self._press_shift_tab(), "break")
+
+    # ---------- 工具 ----------
+
+    def _press_tab(self) -> str:
+        result = self.app._on_editor_tab()
+        self.root.update()
+        return result
+
+    def _press_shift_tab(self) -> str:
+        result = self.app._on_editor_shift_tab()
+        self.root.update()
+        return result
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,10 +4,13 @@ import ctypes
 import os
 import re
 import sys
+import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 
+import speech
 from image_export import (
     DEFAULT_BODY_SIZE as EXPORT_BODY_SIZE,
     DEFAULT_MARGIN as EXPORT_MARGIN,
@@ -41,12 +44,14 @@ from storage import (
     new_note_path,
     purge_trash_entry,
     read_markdown,
+    replace_with_retry,
     restore_from_trash,
     reveal_in_explorer,
     set_default_folder,
     set_settings,
     signature,
     trash_entry_path,
+    unique_path,
 )
 
 
@@ -315,6 +320,10 @@ ITALIC_COLOR = "#A87514"        # 斜体：琥珀金，亮
 LIST_MAX_LEVEL = 4
 LIST_INDENT = 20
 LIST_MARKER_GAP = 10
+# 源码里一层缩进写几个空格。**必须和 `_indent_level` 的换算式一致**（那边是
+# `空格数 // 2`），否则 Tab 缩进一层、解析出来的层级却是另一层。
+# 注意这和上面 `LIST_INDENT`（每层 20 逻辑**像素**的视觉缩进）是两码事。
+LIST_INDENT_STEP = 2
 LIST_MARKER_R = 3               # 项目符号半径（逻辑像素）
 # 每层项目符号换一种颜色，层级一眼可辨（0 层实心、1 层空心、2 层方块）
 BULLET_COLORS = ("#3B6FE0", "#2E9E6B", "#D9822B", "#8E5BD0", "#3F9EB8")
@@ -957,11 +966,38 @@ def _inline_spans(line: str) -> tuple[list[tuple[int, int, str]], list[tuple[int
     for tag, pattern in EMPHASIS_PATTERNS:
         if not available[tag]:
             continue
-        for match in pattern.finditer(line):
+        # **用「搜索 + 手动推进」而不是 `finditer`。** 两处原因，都踩过：
+        #
+        # 1. 判「这对强调能不能用」时**只看那两对记号**，不看中间的内容。原来的写法是
+        #    拿整个 `start..end` 去比：只要区间跟别人有重叠就整段放弃，于是「加粗里套
+        #    行内代码」（`**未压缩的 `.wav`**`）会**整段失效**——行内代码先 claim 了
+        #    `.wav` 那一小段，加粗的区间跟它重叠，加粗就被丢掉，四个星号原样画在图上。
+        #    改成只看记号之后，加粗照常生效，行内代码那一小段仍由 `code` 盖住
+        #    （`EXPORT_STYLE_ORDER` 里 `code` 排在最后 = 赢）。
+        #
+        # 2. `finditer` 的匹配**不重叠**，这会把后面的真记号一起吃掉。反例：
+        #    ``**念的是正文**：`**`、后面还有 **真的加粗** 结尾。``
+        #    第二段匹配从反引号里的那个 `**` 开头、把「真的加粗」那对星号当成自己的
+        #    收尾——开头落在代码区间里，整段被丢掉，于是**真的那对加粗从没被匹配过**，
+        #    四个星号全露出来。用户稿子里「用反引号举例说明 `**` 怎么写」的地方就会这样。
+        #    改成被挡下时从 `start + 1` 重新搜，就会退回到真正的那个开头。
+        #
+        # 反过来 `` `a*b*c` `` 照样不会被斜体化：那两个 `*` 落在代码区间**内部**，
+        # 记号判定同样把它们挡住。`**a*b*c**` 里那对 `*` 也落在加粗区间内部，行为不变。
+        # 空区间不参与判定（`blocked` 对空区间会给出假阳性）。
+        search_from = 0
+        while True:
+            match = pattern.search(line, search_from)
+            if match is None:
+                break
             start, end = match.span()
-            if blocked(start, end):
+            inner = (match.start(1), match.end(1))
+            if any(blocked(left, right) for left, right in
+                   ((start, inner[0]), (inner[1], end)) if right > left):
+                search_from = start + 1
                 continue
-            apply(tag, (match.start(1), match.end(1)), (start, end))
+            apply(tag, inner, (start, end))
+            search_from = end
     return spans, marks
 
 
@@ -1239,16 +1275,89 @@ def _card_excerpt(path: Path, max_lines: int = CARD_EXCERPT_LINES) -> str:
     return " ".join(lines)
 
 
+#: Windows 文件名里不允许出现的字符 → 换成全角同形字。
+#: 直接删掉会把 `第1章/第2节` 变成 `第1章第2节`，两截粘在一起读不出边界。
+_FILENAME_FALLBACK = {
+    "\\": "＼", "/": "／", ":": "：", "*": "＊",
+    "?": "？", '"': "＂", "<": "＜", ">": "＞", "|": "｜",
+}
+
+#: Windows 保留设备名，不能拿来做文件名主干（`CON.md` 一样是保留的）。
+_RESERVED_FILENAME_STEMS = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{index}" for index in range(1, 10)]
+    + [f"LPT{index}" for index in range(1, 10)]
+)
+
+#: 文件名主干最多留多少个字符。标题可以写很长，但文件名太长在文稿列表里根本读不完，
+#: 也容易撞上 Windows 单段 255 字符的上限。
+FILENAME_MAX_CHARS = 80
+
+
+def first_h1_title(text: str) -> str | None:
+    """正文**第一行**是一级标题时返回标题文字，否则返回 None。
+
+    只看第一行，不看后面：用户要的是「文件名 = 文档标题」，而标题就是开头那一行。
+    开头先空一行再写标题也算「第一行不是标题」——那行标题在用户心里已经不是标题了。
+
+    标题文字为空（只写了 `# `）时同样返回 None，调用方据此放弃改名。
+
+    用 `parse_block` 而不是自己写正则，保证「哪里算标题」和编辑区渲染、卡片摘录
+    是同一套判断，不会出现一边认标题、一边不认的情况。
+    """
+    lines = split_document_lines(text)
+    if not lines:
+        return None
+    info = parse_block(lines[0])
+    if info.kind != "heading" or info.level != 1 or info.marker is None:
+        return None
+    title = lines[0][info.marker[1]:].strip()
+    return title or None
+
+
+def title_to_filename(title: str) -> str | None:
+    """把一级标题变成合法的文件名主干；清完什么都不剩就返回 None。
+
+    Windows 禁 `\\ / : * ? " < > |` 和 0x00–0x1F 控制字符，且主干末尾不能是句点或
+    空格。禁字符换全角同形字（见 `_FILENAME_FALLBACK`），控制字符直接删；连续空白
+    压成一个空格；末尾的句点与空格削掉；超过 `FILENAME_MAX_CHARS` 截断；撞上保留
+    设备名就补一个下划线。
+
+    **清完为空必须返回 None，不能返回空串**：调用方据此放弃改名、让文件保住原名。
+    标题被删空时把文件叫成 `.md`，是个谁也打不开的名字。
+    """
+    cleaned = "".join(
+        _FILENAME_FALLBACK.get(char, "" if ord(char) < 32 and not char.isspace() else char)
+        for char in title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(". ")
+    # 截断之后还要再削一次：正好切在句点上就留下个 Windows 不接受的结尾
+    cleaned = cleaned[:FILENAME_MAX_CHARS].rstrip(". ")
+    if not cleaned:
+        return None
+    # 保留名的判定看**第一个点之前**那一段：`NUL.md` 在 Windows 上一样是保留的。
+    # 下划线要插进那一段里（`NUL_.md`），加在末尾（`NUL.md_`）等于没改。
+    head, dot, tail = cleaned.partition(".")
+    if head.strip().upper() in _RESERVED_FILENAME_STEMS:
+        cleaned = f"{head}_{dot}{tail}"
+    return cleaned
+
+
 class JianJiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.folder: Path | None = None
         self.current_path: Path | None = None
         self.disk_signature: FileSignature | None = None
+        # 载入这篇文稿时的一级标题。存盘时拿它跟当前标题比，**只有真的改过才改名**
+        # （见 `_follow_title`）——不然第一次保存就会把用户自己起的老名字整片换掉。
+        self._title_at_load: str | None = None
         self.dirty = False
         self.save_job: str | None = None
         self.settings_job: str | None = None
         self.watch_job: str | None = None
+        # 音频导出在后台线程里跑（合成很慢），主线程只轮询进度
+        self._speech_job: dict | None = None
+        self._speech_poll: str | None = None
         self.file_paths: list[Path] = []
         self.scope_folder: Path | None = None
         self.trash_mode = False
@@ -1775,6 +1884,12 @@ class JianJiApp:
         # 有序列表的序号续写。绑定在**控件级**（不是 bind_all），
         # 返回 "break" 就吃掉这次回车，不让 Text 的类绑定再插一个换行。
         self.editor.bind("<Return>", self._on_editor_return)
+        # Tab / Shift+Tab 调列表层级。同样是控件级 + 返回 "break"：
+        # Tab 不能落回 Tk 默认的「插一个制表符」（一个 \t 会被算成两层），
+        # Shift+Tab 也不能落回默认的「跳到上一个控件」。
+        self.editor.bind("<Tab>", self._on_editor_tab)
+        self.editor.bind("<Shift-Tab>", self._on_editor_shift_tab)
+        self.editor.bind("<ISO_Left_Tab>", self._on_editor_shift_tab)
         # 输入法的组字字体是挂在窗口上的，重新拿到焦点时再设一次最稳妥
         self.editor.bind("<FocusIn>", lambda _event: self._apply_ime_font(), add="+")
 
@@ -1859,6 +1974,133 @@ class JianJiApp:
             messagebox.showerror("导出失败", f"无法读取文档：\n{error}", parent=self.root)
             return "", None
         return text, path
+
+    def speakable_text(self, text: str) -> str:
+        """把一篇 Markdown 变成「念得出来」的纯文本（记号全部去掉）。
+
+        **复用长图那套解析**（`build_export_rows`）：它已经把 `# `、`- `、`1. `、
+        `> `、`**`、`` ` `` 这些记号剥掉了，`Piece.text` 就是纯粹的文字。
+        再写一套「去掉 Markdown」的逻辑，迟早会和导出图对不上——
+        屏幕上、长图里、耳朵里三套文本不一致，是这一轮最该避免的事。
+        """
+        options = self._export_options()
+        lines: list[str] = []
+        for row in build_export_rows(text, options):
+            if row.kind == "hr":
+                continue                    # 分隔线念出来只有噪音
+            if row.kind == "blank":
+                lines.append("")            # 空行 = 停顿
+                continue
+            if row.kind == "table":
+                # 表格按行念，格子之间用顿号，不然会连成一串听不出边界
+                for cells in row.cells:
+                    joined = "、".join(
+                        "".join(piece.text for piece in cell).strip()
+                        for cell in cells)
+                    joined = joined.strip("、")
+                    if joined:
+                        lines.append(joined)
+                continue
+            line = "".join(piece.text for piece in row.pieces).strip()
+            if line:
+                lines.append(line)
+        return "\n".join(lines)
+
+    def _export_default_audio_path(self, path: Path | None = None) -> Path:
+        target = self.current_path if path is None else path
+        if target is not None:
+            return target.with_suffix(".wav")
+        folder = Path(self.folder) if self.folder else Path.home()
+        return folder / "简记朗读.wav"
+
+    def export_audio(self, path: Path | None = None) -> None:
+        """把一篇文档念成音频（WAV）。
+
+        **合成很慢**（中文语速约每秒 3.5 个字），一篇两千字的日记要十来分钟，
+        所以放到后台线程里跑、主线程只轮询进度 —— 直接同步调用会把界面冻住，
+        用户会以为软件卡死了。状态栏显示已用时间，合成完自动打开文件夹。
+        """
+        if self._speech_job is not None:
+            self.status_label.configure(text="上一段音频还在合成，请稍候…")
+            return
+        if not speech.is_available():
+            messagebox.showerror(
+                "无法导出音频",
+                "这台机器上没有可用的语音引擎。\n\n"
+                "「简记」用的是 Windows 自带的语音合成，"
+                "可以在「设置 → 时间和语言 → 语音」里检查是否装了语音包。",
+                parent=self.root)
+            return
+
+        text, source = self._export_source(path)
+        spoken = self.speakable_text(text)
+        if not spoken.strip():
+            self.status_label.configure(text="没有内容可以朗读")
+            return
+
+        default = self._export_default_audio_path(source)
+        chosen = filedialog.asksaveasfilename(
+            title="导出音频", parent=self.root, defaultextension=".wav",
+            initialdir=str(default.parent), initialfile=default.name,
+            filetypes=[("WAV 音频", "*.wav")],
+        )
+        if not chosen:
+            return
+
+        target = Path(chosen)
+        voice = speech.default_voice_name()
+        self._speech_job = {
+            "target": target,
+            "text": spoken,
+            "voice": voice,
+            "error": None,
+            "size": 0,
+            "done": False,
+            "started": time.monotonic(),
+        }
+        self.status_label.configure(
+            text=f"正在合成语音…（{voice or '系统默认音色'}）")
+        self.root.update_idletasks()
+
+        job = self._speech_job
+
+        def work() -> None:
+            """后台线程：只碰 job 字典和文件，**绝不碰任何 Tk 对象**。"""
+            try:
+                job["size"] = speech.synthesize(spoken, target)
+            except Exception as error:                  # noqa: BLE001
+                job["error"] = error
+            finally:
+                job["done"] = True
+
+        threading.Thread(target=work, daemon=True, name="jianji-speech").start()
+        self._speech_poll = self.root.after(300, self._poll_speech_job)
+
+    def _poll_speech_job(self) -> None:
+        """主线程轮询后台合成进度。只有这里能碰 Tk。"""
+        job = self._speech_job
+        self._speech_poll = None
+        if job is None:
+            return
+        if not job["done"]:
+            elapsed = time.monotonic() - job["started"]
+            self.status_label.configure(
+                text=f"正在合成语音…已用 {elapsed:.0f} 秒（长文可能要几分钟）")
+            self._speech_poll = self.root.after(300, self._poll_speech_job)
+            return
+
+        self._speech_job = None
+        error = job["error"]
+        if error is not None:
+            self.status_label.configure(text="导出音频失败")
+            messagebox.showerror("导出音频失败",
+                                 f"合成语音时出错：\n{error}", parent=self.root)
+            return
+        target = job["target"]
+        seconds = speech.wav_seconds(target)
+        length = f"（约 {seconds:.0f} 秒）" if seconds else ""
+        self.status_label.configure(text=f"已导出音频：{target.name}{length}")
+        self._reveal(target)
 
     def export_long_image(self, path: Path | None = None) -> None:
         """把一篇文档整篇导出成一张适合在手机上读的长图。
@@ -2730,6 +2972,7 @@ class JianJiApp:
         menu.add_command(label="在资源管理器中显示", command=lambda: self._reveal(path))
         # 导出长图原先在顶栏，现在集中到这里：右键哪一篇就导出哪一篇
         menu.add_command(label="导出长图", command=lambda: self.export_long_image(path))
+        menu.add_command(label="导出音频", command=lambda: self.export_audio(path))
 
         targets = self._move_targets(path)
         move_menu = tk.Menu(menu, tearoff=0)
@@ -3461,6 +3704,10 @@ class JianJiApp:
         was_current = path == self.current_path
         if was_current and self.dirty and not self.save_now():
             return
+        if was_current:
+            # 刚才那次存盘可能按标题把文件改了名（见 `_follow_title`），
+            # 手里的 path 会指向一个已经不存在的名字
+            path = self.current_path
         try:
             moved = move_to_folder(path, target, self.folder)
         except (OSError, FileNotFoundError) as error:
@@ -3503,6 +3750,9 @@ class JianJiApp:
         was_current = path == self.current_path
         if was_current and self.dirty and not self.save_now():
             return
+        if was_current:
+            # 存盘可能已按标题改名，重新取一次路径，否则会拿着旧名字去回收
+            path = self.current_path
         try:
             entry = move_to_trash(path, self.folder)
         except (OSError, FileNotFoundError) as error:
@@ -3570,10 +3820,14 @@ class JianJiApp:
             self.editor.mark_set("insert", cursor)
         self.editor.edit_reset()
         self.editor.edit_modified(False)
+        # 「载入时的标题」的基准点。存盘时靠它判断标题有没有被改过（见 `_follow_title`），
+        # 所以必须跟着正文一起重置——主题重建时也会走这里，那时正文没变，基准点照旧。
+        self._title_at_load = first_h1_title(text)
 
     def _clear_editor(self) -> None:
         self.current_path = None
         self.disk_signature = None
+        self._title_at_load = None
         self.preview_mode = False
         self.dirty = False
         if self.save_job:
@@ -3684,8 +3938,51 @@ class JianJiApp:
             return False
         self.dirty = False
         self.status_label.configure(text="")
+        # 正文落盘之后再改名：万一改名这一步出错，内容也已经安全写进去了
+        self.current_path = self._follow_title(self.current_path, text)
         self.refresh_files(self.current_path)
         return True
+
+    def _follow_title(self, path: Path, text: str) -> Path:
+        """存盘后让文件名跟随一级标题，返回改名后的路径（没改就原样返回）。
+
+        **只有标题真的被改过才改名**（拿 `_title_at_load` 比）。不卡这一道，第一次
+        保存就会把老文稿整片改名，而用户文稿里现成的反例一抓一把：
+        `2026-09-13.md` 与 `2026-09-14.md` 的 H1 都是 `# 今日日记`（照 H1 改名会当场
+        撞车）、`开发记录.md` 的 H1 是 `# 简记优化记录`、`说明书/简记使用说明.md` 的
+        H1 是 `# 简记 · 使用说明`。这些名字是用户自己起的，不该被软件悄悄换掉。
+
+        重名走 `unique_path` 加 `-2`、`-3`，**绝不覆盖**别人的文件。
+
+        改完 `current_path` 指向新名字下的同一个文件，`disk_signature` 仍然有效——
+        改名不动修改时间也不动内容，`signature()` 的三个字段（mtime、size、digest）
+        一个都没变，所以外部改动监测不会误报。
+
+        改名失败只提示一句、不动任何状态：正文已经存进去了，没什么可丢的，
+        不值得弹个错误框吓人。
+        """
+        title = first_h1_title(text)
+        if title is None or title == self._title_at_load:
+            return path
+        stem = title_to_filename(title)
+        # 先把这个标题认下来：即便下面清不出合法文件名、或者改名失败，
+        # 也不再拿同一个标题反复试、反复弹提示
+        self._title_at_load = title
+        if stem is None or stem == path.stem:
+            return path
+        target = path.with_name(f"{stem}{path.suffix}")
+        if target.exists():
+            # 只改大小写时 target 就是 path 自己（Windows 不区分大小写），这时加序号
+            # 会变成「待办.md → 待办-2.md」这种莫名其妙的改名
+            if os.path.normcase(str(target)) != os.path.normcase(str(path)):
+                target = unique_path(path.parent, target.name)
+        try:
+            replace_with_retry(path, target)
+        except OSError:
+            self.status_label.configure(text="改名失败，文件名保持不变")
+            return path
+        self.status_label.configure(text=f"已改名为：{target.name}")
+        return target
 
     def _resolve_external_conflict(self, text: str) -> bool:
         answer = messagebox.askyesnocancel(
@@ -4522,11 +4819,24 @@ class JianJiApp:
                 continue
             if tag == "highlight" and not has_highlight:
                 continue
-            for match in spans(pattern):
+            # 只看记号、不看内容，且被挡下时从 `start + 1` 重新搜——和
+            # `_inline_spans` 一字不差地同步（理由见那里两段注释：既不能因为
+            # 「加粗里套了行内代码」整段放弃，也不能让反引号里的 `**` 把后面
+            # 真正的那对记号当成收尾吃掉）。两边不同步的话，同一行文字在屏幕上
+            # 一个样、导出的长图上另一个样。
+            search_from = base
+            while True:
+                match = pattern.search(line, search_from)
+                if match is None:
+                    break
                 start, end = match.span()
-                if blocked(start, end):
+                inner = (match.start(1), match.end(1))
+                if any(blocked(left, right) for left, right in
+                       ((start, inner[0]), (inner[1], end)) if right > left):
+                    search_from = start + 1
                     continue
-                apply(tag, (match.start(1), match.end(1)), (start, end))
+                apply(tag, inner, (start, end))
+                search_from = end
 
     def _tag_syntax(self, line: int, start: int, end: int, cursor_line: int) -> None:
         tag = "syntax_current" if line == cursor_line else "syntax"
@@ -4627,6 +4937,85 @@ class JianJiApp:
         # 程序化 insert 不像键盘输入那样自动把光标带进视口：在页面底部回车时
         # 新行会落在屏幕外，看起来就像「没换行」。see 只在光标看不见时才滚。
         self.editor.see("insert")
+        return "break"
+
+    def _selected_line_range(self) -> tuple[int, int]:
+        """这次缩进要处理的逻辑行范围（1 基，闭区间）。
+
+        有选区就按选区取。**选区右端正好落在行首时不算那一行**——「从行中间选到
+        下一行行首」是最常见的拖选方式，把下一行也缩进去会让人以为多缩了一行。
+        """
+        if not self.editor.tag_ranges("sel"):
+            number = int(self.editor.index("insert").split(".")[0])
+            return number, number
+        first = int(self.editor.index("sel.first linestart").split(".")[0])
+        last = self.editor.index("sel.last")
+        if last.endswith(".0"):
+            last = self.editor.index(f"{last} - 1 chars")
+        last_line = int(self.editor.index(f"{last} linestart").split(".")[0])
+        return first, max(first, last_line)
+
+    def _list_lines_in(self, first: int, last: int) -> list[int]:
+        """范围内**确实是列表项**的行号（有序 / 无序 / 任务）。"""
+        return [number for number in range(first, last + 1)
+                if self._block_of(number).kind in ("bullet", "task", "ordered")]
+
+    def _shift_list_level(self, delta: int) -> bool:
+        """把范围内的列表项整体升/降 delta 层，返回是否真的动了。
+
+        层级换算走 `_indent_level`（`空格数 // 2`），所以写回去的缩进一律是空格：
+        原来用 Tab 缩进的行会被顺手归一成空格，层级才稳定。
+        """
+        first, last = self._selected_line_range()
+        lines = self._list_lines_in(first, last)
+        if not lines:
+            return False
+        moved = False
+        for number in lines:
+            line = self.editor.get(f"{number}.0", f"{number}.end")
+            indent = line[:len(line) - len(line.lstrip())]
+            level = _indent_level(indent)
+            target = max(0, min(LIST_MAX_LEVEL, level + delta))
+            if target == level:
+                continue
+            self.editor.delete(f"{number}.0", f"{number}.{len(indent)}")
+            self.editor.insert(f"{number}.0", " " * (target * LIST_INDENT_STEP))
+            moved = True
+        return moved
+
+    def _on_editor_tab(self, _event=None) -> str:
+        """Tab：列表项缩进一层；普通行插两个空格。
+
+        绑定在控件级、一律返回 `"break"`：Tk 给 `Text` 的默认 Tab 行为是**插一个
+        制表符**，而 `_indent_level` 把一个 `\\t` 算成四格 = 两层 —— 不挡住的话，
+        用户敲一次 Tab 再把这行改成列表项，会直接跳到第二层。
+
+        判据是「范围内有没有列表行」，**不是「有没有真的动」**：已经到第 4 层的
+        列表项再按 Tab 必须什么都不做，不能掉进下面「普通行插两个空格」那条路——
+        那样每按一次就多两个空格，缩进会一路涨上去（测试
+        `test_tab_stops_at_the_top_level` 盯着这个）。
+        """
+        first, last = self._selected_line_range()
+        if self._list_lines_in(first, last):
+            self._shift_list_level(+1)
+            # 程序化改文本不像键盘输入那样自动把光标带进视口，行在屏幕外时
+            # 看起来就像「没反应」。see 只在光标看不见时才滚。
+            self.editor.see("insert")
+            return "break"
+        if self.editor.tag_ranges("sel"):
+            return "break"          # 有选区但不是列表：不动内容，免得正文被空格替掉
+        self.editor.insert("insert", " " * LIST_INDENT_STEP)
+        self.editor.see("insert")
+        return "break"
+
+    def _on_editor_shift_tab(self, _event=None) -> str:
+        """Shift+Tab：列表项反缩进一层。
+
+        最低就到第 0 层——**不会顺手把 `1. ` 记号删掉**。删记号等于把列表项变回
+        普通正文，是一次内容改写；层级调错了还能再调回来，记号没了得重打。
+        """
+        if self._shift_list_level(-1):
+            self.editor.see("insert")
         return "break"
 
     def _wrap_selection(self, marker: str):
@@ -5078,7 +5467,7 @@ class JianJiApp:
         窗口销毁时若还有排期，回调会在解释器销毁后触发，抛出
         `invalid command name "..._persist_settings"` 之类的噪音。
         """
-        for name in ("watch_job", "settings_job", "save_job"):
+        for name in ("watch_job", "settings_job", "save_job", "_speech_poll"):
             job = getattr(self, name, None)
             if not job:
                 continue

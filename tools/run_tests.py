@@ -146,6 +146,24 @@ def run_in_process(pattern: str, *, echo: bool = True) -> int:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
+    # **必须在发现任何测试模块之前先把 `main` 导进来。**
+    #
+    # `main` 在导入时会声明进程 DPI 感知（`SetProcessDpiAwareness(2)`），而 Tk 是在
+    # **第一次 `Tk()`** 时按当时的 DPI 定下 `tk scaling` 的。顺序反了——某个测试模块
+    # 先在模块级建了一个探针根、之后才 `import main`——`tk scaling` 会停在 1.332
+    # （未声明感知时按 96 DPI 算）而不是 1.998，于是**整个进程**后面所有量几何的
+    # 用例都跟着歪：`_current_pad` 从 80 掉到 48，标题徽标挤不进留白（画布压根不放置），
+    # 折行填充率从 0.971 掉到 0.898（卡在 0.90 判据下面）。
+    #
+    # 这不是假设，是实测：`tools/_probe_scale_order.py` 同一份代码只换导入顺序，
+    # `tk scaling` 1.998 / 1.332、`_current_pad` 80 / 48、fill 0.971 / 0.898。
+    # 触发它的是一次很普通的改动——新加的 `tests/test_audio_export.py` 名字排在最前，
+    # 而它的模块级探针写在 `import main` 之前。**测试模块的惯例是「先 import main
+    # 再建探针」，但靠惯例挡不住下一个人**，所以在这里钉死。
+    if str(ROOT / "app") not in sys.path:
+        sys.path.insert(0, str(ROOT / "app"))
+    import main  # noqa: F401  （只为副作用：声明 DPI 感知）
+
     REPORT.parent.mkdir(exist_ok=True)
     suite = unittest.TestLoader().discover("tests", pattern=pattern,
                                            top_level_dir="tests")

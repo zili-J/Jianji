@@ -158,6 +158,257 @@ class InlineStyleTests(unittest.TestCase):
         self.assertEqual(len(pieces), 1)
         self.assertFalse(pieces[0].italic)
 
+    # ---- 加粗里套行内代码（回归） ----
+    #
+    # 这一组守的是一次真实回退：判「这段强调能不能用」时，原来拿**整个**匹配区间
+    # （`start..end`，含内容）去跟已占区间比。行内代码先 claim 了 `` `.wav` `` 那一小段，
+    # 加粗的区间跟它重叠，加粗就被整段丢掉——四个星号原样画在长图上。
+    # 用户看到的是「明明写了加粗，图上却冒出 `**`」（说明书导出的长图上真出现过）。
+    #
+    # 正确做法是**只看那两对记号**占没被占，中间的内容不参与判定。
+
+    def test_bold_containing_inline_code_still_bolds(self) -> None:
+        pieces = self.pieces("文件是**未压缩的 `.wav`**，体积不小。")
+        self.assertEqual(self.text_of(pieces),
+                         "文件是未压缩的 .wav，体积不小。")
+        bolded = "".join(piece.text for piece in pieces if piece.bold)
+        self.assertEqual(bolded, "未压缩的 ")
+        code = next(piece for piece in pieces if piece.text == ".wav")
+        self.assertEqual(code.family, self.options.mono_family)
+        self.assertEqual(code.background, app_main.CODE_BG)
+
+    def test_no_asterisk_or_backtick_survives(self) -> None:
+        """记号必须一个不剩——「粗体里套代码」最容易把星号漏出来。"""
+        pieces = self.pieces("文件是**未压缩的 `.wav`**，体积不小。")
+        for piece in pieces:
+            self.assertNotIn("*", piece.text)
+            self.assertNotIn("`", piece.text)
+
+    def test_the_whole_bold_span_is_claimed_not_just_its_marks(self) -> None:
+        """行内代码把中间那段盖住了，加粗仍然拥有**整段**区间。
+
+        否则 `` `**x**` `` 那条规则会反过来失效：代码区间会被后面的强调规则啃掉。
+        """
+        spans, _ = app_main._inline_spans("a**b `c` d**e")
+        self.assertIn((3, 10, "bold"), spans)
+        self.assertIn((6, 7, "code"), spans)
+
+    def test_inline_code_wins_over_the_bold_it_sits_in(self) -> None:
+        """重叠处的字体归 `code`（`EXPORT_STYLE_ORDER` 里 `code` 排最后 = 赢）。"""
+        pieces = self.pieces("**粗 `码` 粗**")
+        code = next(piece for piece in pieces if piece.text == "码")
+        self.assertEqual(code.family, self.options.mono_family)
+        self.assertFalse(code.bold)
+
+    def test_code_keeps_its_stars_and_is_not_italicised(self) -> None:
+        pieces = self.pieces("`a*b*c`")
+        self.assertEqual(self.text_of(pieces), "a*b*c")
+        self.assertEqual(len(pieces), 1)
+        self.assertFalse(pieces[0].italic)
+
+    def test_a_lone_asterisk_inside_bold_does_not_nest_italic(self) -> None:
+        """`**a*b*c**` 里那对单星号落在加粗区间**内部**，行为与以前一致：整段加粗。
+
+        斜体的记号在已占区间里 → 斜体放弃，星号当正文画出来。这条不是「理想
+        Markdown」，但它是既有的、说明书没承诺改的行为，钉住它免得被顺手改掉。
+        """
+        pieces = self.pieces("**a*b*c**")
+        self.assertEqual(self.text_of(pieces), "a*b*c")
+        self.assertTrue(pieces[0].bold)
+        self.assertFalse(pieces[0].italic)
+
+    def test_a_star_that_opens_before_the_bold_marker_is_not_italic(self) -> None:
+        """斜体记号跨在加粗记号上时也不成立：`*a**b**c*` → 里层加粗，外层星号当正文。"""
+        pieces = self.pieces("*a**b**c*")
+        self.assertEqual(self.text_of(pieces), "*abc*")
+        bold = next(piece for piece in pieces if piece.bold)
+        self.assertEqual(bold.text, "b")
+        self.assertFalse(bold.italic)
+
+    # ---- 反引号里的 `**` 会「吃掉」后面那对记号（回归） ----
+    #
+    # 这一组守的是第二次回退，同一个坑的另一半。原来用 `finditer` 扫强调：匹配是
+    # **不重叠**的，于是行内代码里那个当例子写的 `**` 会**开启**一段匹配、把后面
+    # 真正的加粗那对星号当成自己的收尾。这段匹配的开头落在代码区间里 → 整段丢掉，
+    # 而**真正的那对加粗从没被匹配过**，四个星号全留在正文里。
+    #
+    # 用户稿子里「用反引号举例说明 `**` 怎么写」的地方（说明书自己就有）就会这样。
+    # 修法是被挡下时从 `start + 1` 重新搜，退回到真正的那个开头。
+
+    def test_a_literal_star_pair_inside_code_does_not_eat_the_next_pair(self) -> None:
+        line = "**念的是正文**：`**`、后面还有 **真的加粗** 结尾。"
+        pieces = self.pieces(line)
+        self.assertEqual(self.text_of(pieces),
+                         "念的是正文：**、后面还有 真的加粗 结尾。")
+        bolded = [piece.text for piece in pieces if piece.bold]
+        self.assertEqual(bolded, ["念的是正文", "真的加粗"])
+        code = next(piece for piece in pieces if piece.background == app_main.CODE_BG)
+        self.assertEqual(code.text, "**")
+
+    def test_the_retry_stops_at_the_next_real_pair(self) -> None:
+        """被挡下的那个开头只是跳过，不能让整行后面的记号跟着一起失效。"""
+        line = "`**` **a** **b**"
+        spans, _ = app_main._inline_spans(line)
+        self.assertEqual(sorted(line[start:end] for start, end, tag in spans
+                                if tag == "bold"),
+                         ["a", "b"])
+
+    def test_a_lone_pair_between_two_code_spans_still_works(self) -> None:
+        pieces = self.pieces("`x` **粗** `y`")
+        bold = next(piece for piece in pieces if piece.bold)
+        self.assertEqual(bold.text, "粗")
+        self.assertEqual(self.text_of(pieces), "x 粗 y")
+
+
+# ---------- 导出与编辑区的一致性 ----------
+
+class _FakeEditor:
+    """只记 `tag_add` 的空壳编辑器。"""
+
+    def __init__(self) -> None:
+        self.added: list[tuple[str, int, int]] = []
+
+    def tag_add(self, tag: str, first: str, last: str) -> None:
+        # 索引形如 "1.7"
+        self.added.append((tag, int(first.split(".", 1)[1]),
+                           int(last.split(".", 1)[1])))
+
+
+class _TagHarness:
+    """够 `_tag_inline` 跑起来的最小宿主。
+
+    不建 `Tk` 也不建整个 `JianJiApp`：`_tag_inline` 只用到 `self.editor.tag_add`、
+    `self._tag_syntax`、`self._line_marks` 这三样，其余一概不碰。这样这一组
+    在没有图形界面的机器上也跑得动。
+    """
+
+    _tag_inline = app_main.JianJiApp._tag_inline
+    _tag_syntax = app_main.JianJiApp._tag_syntax
+
+    def __init__(self) -> None:
+        self.editor = _FakeEditor()
+        self._line_marks: dict = {}
+
+
+class InlineParityTests(unittest.TestCase):
+    """`_inline_spans`（导出长图 / 音频）与 `_tag_inline`（编辑区）必须是同一批区间。
+
+    这两处是同一套规则的两次实现。改了一处忘了另一处，就会出现「屏幕上看着是
+    加粗、导出的长图上却是四个星号」——本轮修的就是这个，所以顺手把两边钉在一起。
+    """
+
+    LINES = (
+        "有 **粗体** 和 `代码` 和 [链接](http://a.b) 和 ~~删~~。",
+        "文件是**未压缩的 `.wav`**，体积不小：一分钟大约 2.5 MB。",
+        "**粗 `码` 粗**",
+        "`**x**`",
+        "**a*b*c**",
+        "*a**b**c*",
+        "`a*b*c`",
+        "==亮== 与 ![图](b.png)",
+        "[**粗**](a)",
+        "一行没有任何记号的正文",
+        "",
+    )
+
+    def harness(self) -> _TagHarness:
+        return _TagHarness()
+
+    def editor_spans(self, line: str):
+        host = self.harness()
+        host._tag_inline(1, line, 99)          # 光标在别处 → 记号挂 syntax 而不是 syntax_current
+        return {(tag, start, end) for tag, start, end in host.editor.added
+                if tag not in ("syntax", "syntax_current")}, host
+
+    def test_style_spans_match(self) -> None:
+        for line in self.LINES:
+            with self.subTest(line=line):
+                spans, _ = app_main._inline_spans(line)
+                expected = {(tag, start, end) for start, end, tag in spans}
+                got, _ = self.editor_spans(line)
+                self.assertEqual(got, expected)
+
+    def test_mark_spans_match(self) -> None:
+        """要藏起来的记号（星号/反引号/链接括号）两边也得一样。"""
+        for line in self.LINES:
+            with self.subTest(line=line):
+                _, marks = app_main._inline_spans(line)
+                _, host = self.editor_spans(line)
+                recorded = {(start, end) for line_no, entries in host._line_marks.items()
+                            for _off, _on, start, end, _indent in entries}
+                self.assertEqual(recorded, set(marks))
+
+    def test_marks_are_never_empty_ranges(self) -> None:
+        """空记号区间会让编辑器多插一个零宽标签，也可能骗过 `blocked`。"""
+        for line in self.LINES:
+            with self.subTest(line=line):
+                _, marks = app_main._inline_spans(line)
+                for start, end in marks:
+                    self.assertLess(start, end)
+
+
+class GuideMarkupTests(unittest.TestCase):
+    """说明书自己渲染一遍，正文里不该露出任何 Markdown 记号。
+
+    这不是「多此一举」：说明书是用户真正会打开的那个文件，它的长图是导出链路的
+    成品验收。已经栽过两次——
+
+      · 加粗里套行内代码（`**未压缩的 `.wav`**`）整段失效，四个星号画在图上；
+      · 反引号里当例子写的 `**` 把后面真那对记号当成收尾吃掉。
+
+    两次都是「代码写得对、说明书里那行写法撞上了边角」，靠人眼看长图才发现。
+    这里改成让机器看：正文（非代码）的每一块文字都不许出现 `**`、`~~`、`==`、反引号。
+    """
+
+    GUIDE = PROJECT / "简记使用说明.md"
+
+    def rows(self):
+        text = self.GUIDE.read_text(encoding="utf-8")
+        return app_main.build_export_rows(text, small_options(
+            width=1080, margin=32, body_size=30, line_height=44, mono_size=28,
+            list_indent=36, list_marker_gap=18, marker_radius=6, task_box=22,
+            quote_bar_width=6, quote_bar_gap=26, badge_size=16, badge_gap=14,
+            head_gap=10, table_padding=16))
+
+    def pieces_of(self, row):
+        if row.pieces:
+            yield from row.pieces
+        for cell in (row.cells or []):
+            for piece_list in cell:
+                yield from piece_list
+
+    def test_guide_exists(self) -> None:
+        self.assertTrue(self.GUIDE.exists(), f"找不到说明书：{self.GUIDE}")
+
+    def test_no_markdown_marks_leak_into_the_body(self) -> None:
+        leaks = []
+        for index, row in enumerate(self.rows()):
+            if row.kind == "code":              # 代码块里当然要原样写记号
+                continue
+            for piece in self.pieces_of(row):
+                if piece.background == app_main.CODE_BG:   # 行内代码同理
+                    continue
+                for mark in ("**", "~~", "==", "`"):
+                    if mark in piece.text:
+                        leaks.append(f"row{index} {row.kind} {mark!r}: {piece.text!r}")
+        self.assertEqual(leaks, [], "说明书里有记号漏出来了：\n  " + "\n  ".join(leaks))
+
+    def test_no_bold_or_italic_span_crosses_a_source_line(self) -> None:
+        """跨源行的行内记号认不出来，屏幕/长图/音频三处都会露出源码。
+
+        这是编辑器的设计（逐行解析，见说明书「补充说明」），不是 bug——
+        但说明书自己不能踩。所以这里直接扫源文件。
+        """
+        offenders = []
+        for number, line in enumerate(self.GUIDE.read_text(encoding="utf-8").split("\n"), 1):
+            # 行内代码里的记号是**举例**用的（说明书里到处在讲记号怎么写），先剔掉
+            bare = re.sub(r"`[^`\n]*`", "", line)
+            for mark in ("**", "~~", "=="):
+                if bare.count(mark) % 2:
+                    offenders.append(f"第 {number} 行 {mark!r} 落了单"
+                                     f"（{bare.count(mark)} 个）：{line.strip()[:60]!r}")
+        self.assertEqual(offenders, [], "记号没有成对出现在同一行：\n  " + "\n  ".join(offenders))
+
 
 # ---------- 块级结构 ----------
 

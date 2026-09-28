@@ -2806,3 +2806,308 @@ if tail is not None and tail[1] == first[1]:
 - **删掉末尾换行后留白有空洞**：重新打开即恢复；补回来会让末尾空行删不掉，权衡后选了前者。
 - **滚动卡顿没有根治**：本轮砍掉的是「白问」的那部分。滚动成本本身 ∝ 装饰画布数量，
   根治要把装饰改成 `text image_create`，还没做。
+
+## 2026-09-28 四项更新（行尾统一 / 列表缩进 / 导出音频 / 文件名跟随标题）
+
+用户一次给了两件仓库事 + 三条功能：
+
+> ① 仓库里 7 个文本文件 CRLF 统一成 LF 并加 `.gitattributes`；② 要加个 git 远端做备份。
+> 另：1. 新增将文字转换成音频导出功能（出现在文档预览右键菜单）；
+> 2. 当第一行是一级标题时，把文档文件名改成该标题，且可根据该行修改而更新标题；
+> 3. 有序列表增加层级至 4 级。
+
+② 的远端 URL 用户说「我给」，**还没给**，先挂着。
+
+### ① 行尾统一 LF + `.gitattributes`
+
+7 个文件（`app/image_export.py`、`tools/_probe_editor_wrap.py`、5 个 memory 文件）CRLF → LF，
+新增 `.gitattributes`：
+
+```gitattributes
+* text=auto eol=lf
+*.png binary
+...
+```
+
+**为什么不是只写 `text=auto`**：那样只规范**仓库**，工作区重新检出时还是 CRLF，
+本地脚本照样看到两种行尾。加上 `eol=lf` 工作区才是 LF。
+
+转换只做 `\r\n` → `\n`，**单独一个 `\r` 原样保留**——Tk 把行尾的 `\r` 当**行内容**，
+翻掉会让行号错位。
+
+**踩的坑**：`git add --renormalize .` 会把 7 个 `outputs/` 文件当成**删除**塞进索引
+（`outputs/*` 被 gitignore，renormalize 后的临时路径不再匹配跟踪模式）。
+改成显式 `git add` 那 7 个源文件 + `.gitattributes` 才对。
+
+验证：`git check-attr`（文本文件 `eol: lf`、zip `text: unset`）+ 全仓扫一遍
+**0 个文本文件还含 CRLF**。提交 `01d0c7b`。
+
+### ③ 有序列表 4 级 → 其实是「Tab 没绑」
+
+先量现状再动手，结论和预期相反：**解析、缩进、序号画布、回车续号在 5 个层级上本来就是对的**
+（`LIST_MAX_LEVEL = 4`，`li0`…`li4`，`_indent_level(indent) = min(4, 空格数 // 2)`，`\t` 算 4 空格），
+核验图 `outputs/_层级核验-现状.png`。**真正缺的是按键绑定**——缩进只能手敲空格。
+
+所以这一条做成了 `Tab` / `Shift+Tab`（`_shift_list_level(delta)`，按 `LIST_INDENT_STEP = 2` 重写行首缩进）：
+
+| 场景 | 行为 |
+| --- | --- |
+| 列表行按 `Tab` | 缩进一级，最多 4 级（第 4 级再按**什么都不做**，也不插空格） |
+| 列表行按 `Shift+Tab` | 退回一级，最少 0 级（**保留记号**，只删缩进） |
+| 选中多行 | 整段一起动 |
+| 普通正文按 `Tab` | 插入两个空格（不改变原有的缩进习惯） |
+| 选区末尾正好停在下一行行首 | 那一行**不算在内**（`_selected_line_range` 把 `sel.last` 的 `.0` 退一格） |
+
+两个必须做对的地方：
+
+- **Tk 的 `<Tab>` 默认插一个 `\t`**，而 `_indent_level` 把 `\t` 算成 4 空格 = **2 级** ——
+  所以必须拦下来并返回 `"break"`，否则「按一下 Tab 跳两级」。
+- **分派要按「范围内有没有列表行」，不能按「有没有移动」**：第 4 级再按 `Tab` 时
+  `_shift_list_level` 什么都没动，按「有没有移动」判断就会掉进「插入两个空格」那个分支。
+  这条是被测试抓出来的（`test_tab_stops_at_the_top_level` 红：`'          1. 已经最深' != '        1. 已经最深'`）。
+
+核验 `tools/probe_tab_indent.py` + `outputs/_Tab缩进-核验.png`；测试 `tests/test_list_editing.py`
+的 `ListIndentKeyTests`（`-k list_editing` 共 **61** 项）。
+
+### 1. 导出音频（纯 ctypes 驱动 SAPI）
+
+菜单项加在 `_doc_menu` 的「导出长图」下面。**念的文本走 `speakable_text()`，它复用长图那套
+`build_export_rows`** —— 屏幕上、长图里、耳朵里必须是同一套解析。实测「漏出的记号：无」，
+`#`/`*`/`` ` ``/`> `/`- `/`|`/`---`/`1. ` 一个都没漏（漏了会被真的念成「井号」「星号」）；
+表格按行念、格子之间用顿号，分隔线跳过。
+
+**为什么是纯 ctypes 而不是外部命令**：`Add-Type` 与 `New-Object -ComObject` 在这个
+PowerShell 工具里被安全策略挡着（「Command blocked for security」），那条路根本没法核验。
+改成自己用 ctypes 走 `IDispatch` 晚绑定驱动 `SAPI.SpVoice` + `SAPI.SpFileStream`，
+**可测、无第三方依赖**。踩到的四个坑都写在 `app/speech.py` 的模块 docstring 里：
+
+| 坑 | 现象 | 修法 |
+| --- | --- | --- |
+| `SysAllocString` 没声明 `restype` | BSTR 被截成 32 位 → **access violation** | `restype = c_void_p` |
+| `CoCreateInstance.argtypes` 用了字符串前向引用 `POINTER("_GUID")` | ctypes **静默**接受，传进去是野指针 → access violation | `argtypes` 挪到 `_GUID` 定义**之后** |
+| `DISPPARAMS.rgvarg` 是**倒序**的 | `DISP_E_TYPEMISMATCH (0x80020005)`（不是崩溃） | 在 `_invoke` 里反转，调用点仍按源码顺序写 |
+| `GetVoices` 是**方法**（dispId 17）不是属性 | 当属性取 → `DISP_E_MEMBERNOTFOUND`；名字写错 → `DISP_E_UNKNOWNNAME` | 按方法调，**并且必须收结果 VARIANT** |
+
+另外查了注册表：`HKCU\...\Speech\Voices\DefaultTokenId` = `Microsoft Huihui Desktop - Chinese (Simplified)`，
+**系统默认音色本来就是中文**，于是整块「音色选择」删掉了（原来那条路要用 `out` BSTR 参数取
+`GetDescription`，实测 `DISP_E_TYPEMISMATCH`，不值得为它增加脆弱面）。
+
+**合成很慢**：中文实测 **3.52 字/秒**，两千字的日记要十来分钟。所以走
+**后台线程 + 主线程 `root.after(300)` 轮询**（`_speech_job` / `_speech_poll`），
+状态栏显示「正在合成语音…已用 N 秒」。实测 `export_audio` **0.03 秒返回**（桩函数睡 0.4 秒），
+主线程没有被挡住；完成时状态栏「已导出音频：朗读核验.wav（约 36 秒）」并自动打开文件夹。
+时长用 `wave` 模块读**真实头部**，不拿「字节数 ÷ 44100」估（那假设了固定格式）。
+核验 `tools/probe_audio_export.py`（写出 338388 字节、22050 Hz 单声道 16 位、7.67 秒）。
+
+### 2. 文件名跟随一级标题
+
+**先说结论：不能做成「一存盘就按 H1 改名」。** 扫了一遍用户的真实文稿，反例一抓一把：
+
+| 文件 | 第一行 | 照 H1 改名的后果 |
+| --- | --- | --- |
+| `2026-09-13.md` | `# 今日日记` | 变成 `今日日记.md` |
+| `2026-09-14.md` | `# 今日日记` | 和上一篇**当场撞车** |
+| `开发记录.md` | `# 简记优化记录` | 用户自己起的名字被换掉 |
+| `说明书/简记使用说明.md` | `# 简记 · 使用说明` | 同上 |
+| `新建-2026-09-13-215259.md` | 表格行（没有 H1） | — |
+
+所以规则是：**只有标题相对「载入时」真的被改过才改名**。基准点 `self._title_at_load`
+由 `_load_editor_text` 从正文第一行取（`_clear_editor` 清空）。这样
+「打开老文稿只改正文」和「新建后不动占位标题」都不会动文件名，而
+「把 `# 新建文档` 改成 `# 健身计划调整`」会立刻改名。
+
+其余细节：
+
+- **只认第一行**（`first_h1_title`）。开头先空一行、或者第一行是 `## 二级标题`、或者只写了 `# ` → 都不改名。
+  标题被清空时**保持原名**（把文件叫成 `.md` 是谁也打不开的名字）。
+- **禁字符换全角同形字**：`\ / : * ? " < > |` → `＼ ／ ： ＊ ？ ＂ ＜ ＞ ｜`。
+  直接删掉会把 `第1章/第2节` 粘成 `第1章第2节`，两截读不出边界。控制字符删掉、连续空白压成一个空格、
+  末尾的句点与空格削掉、超 80 字截断。
+- **保留设备名看第一个点之前那一段**：`NUL.md` 在 Windows 上一样是保留的，
+  下划线要插进那一段（`NUL_.md`）——加在末尾（`NUL.md_`）等于没改。
+- **撞名走 `unique_path`**（`-2`、`-3`），绝不覆盖。只改大小写时不加序号（Windows 不区分大小写，
+  `待办`→`待办` 不该变成 `待办-2.md`）。
+- **改名在正文落盘之后**：改名失败只是状态栏一句「改名失败，文件名保持不变」，内容已经安全写进去了。
+- `disk_signature` 改名后**仍然有效**（改名不动 mtime/size/digest），所以外部改动监测不会误报。
+
+**顺手修掉一条被改名牵连的既有路径**：`move_document_to` / `delete_document` 都是
+「先 `save_now` 再拿手里的 `path` 去干活」，改名会让那个 `path` 指向一个**已经不存在的名字**
+（`move_to_trash` 会抛 `FileNotFoundError`，`move_to_folder` 也一样）。两处都补上
+`if was_current: path = self.current_path`，并各写了一条回归测试。
+
+核验 `tools/_probe_title_rename.py`（**27 项全过**，含上面每一个反例）+ `tests/test_title_rename.py`（39 项）。
+
+### 顺带抓到一个测试基建的隐形地雷：`import main` 必须排在第一次 `Tk()` 之前
+
+全量跑出 **3 条红**，全在量几何的用例上（`test_heading_labels` 的徽标位置、
+`test_markdown_syntax.SpaceDelimitedWrapTests` 的折行填充率），而**单独跑那两个模块全绿**。
+
+定位过程（每一步都有数据）：
+
+| 跑法 | 结果 |
+| --- | --- |
+| HEAD（改动前，643 项） | OK |
+| 只带 `app/main.py` 改动、不带新测试文件（672 项） | OK |
+| 全量（738 项） | **3 红** |
+| 只跑 `test_heading_labels` + `test_markdown_syntax` | OK |
+| 只跑 `test_audio_export` + 上面两个 | **3 红，且数字逐位相同（0.8980070339976554）** |
+
+所以触发者是新加的 `tests/test_audio_export.py`，而且它**名字排在最前**、模块级探针
+（`_probe = tk.Tk()`）写在 `import main` 之前。机制：
+
+`main` **在导入时**声明进程 DPI 感知（`SetProcessDpiAwareness(2)`），
+而 **Tk 是在第一次 `Tk()` 时按当时的 DPI 定下 `tk scaling` 的**。顺序反了，
+Tk 就按「未声明感知」的 96 DPI 算缩放，之后声明也追不回来：
+
+| | 先 import main | 先建 Tk 根（错的） |
+| --- | --- | --- |
+| `SCALE`（main 自己算的） | 1.5 | 1.5 |
+| **`tk scaling`（Tk 自己算的）** | **1.998** | **1.332** |
+| `_current_pad` | 80 | **48** |
+| 标题徽标画布 | `place`，x=23 | **`''`（压根没放置）** |
+| 第 3 行折行填充率 | 0.971 | **0.898**（卡在 0.90 判据下面） |
+
+编辑区宽两态都是 949px —— 所以这**不是**「窗口没排好版」的偶发，而是**确定性的**。
+复现脚本 `tools/_probe_scale_order.py`（同一份代码只换导入顺序，两组数都打出来）。
+
+**两层修法**：
+
+1. `tests/test_audio_export.py` 在模块级探针**之前**加一行 `import main`（跟上其他测试模块的惯例）；
+2. `tools/run_tests.py` 的 `run_in_process()` 里，在**发现任何测试模块之前**先 `import main`。
+   这才是真兜底——靠惯例挡不住下一个把探针写在前面的人，而这个坑的表征（几个量几何的用例红、
+   单独跑全绿、数字还每次一样）极难从失败信息反推。
+
+> 这也是为什么一开始差点判成「偶发 flaky」：单看失败信息，0.898 vs 0.90 只差 0.2%，
+> 很像浮点/布局暂态。**是「数字逐位相同」这一点把它钉成了确定性**——
+> 真 flaky 不会连小数位都一样。
+
+### 本轮验证
+
+- **全量测试 738 项 OK**（`outputs/test-output.txt`）。改动前 HEAD 是 643 项，净增 95
+  （`test_title_rename.py` 39 + `test_audio_export.py` 27 + `test_list_editing.py` 29）。
+- 使用说明更新四处（文件名跟随标题 / Tab 缩进 / 导出音频 / 新建文稿流程）并同步到
+  `C:\Users\22910\Documents\wb01\说明书\`，长图重出。
+- 临时探针（`probe_list_levels.py`、`probe_tab_indent.py`、`probe_sapi_ctypes.py`、
+  `probe_disp_names.py`、`probe_audio_export.py`、`shot_pad_pair.py`）跑完删掉；
+  只留 `tools/_probe_title_rename.py` 与 `tools/_probe_scale_order.py` 两个有长期价值的。
+
+### 已知取舍
+
+- **改名只在「标题被改过」时发生**：用户若想让一篇老文稿的文件名去对齐它现有的 H1，
+  得把标题改一下（哪怕改一个字再改回来）。这是为了不让软件批量改掉用户自己起的名字，故意的。
+- **合成期间不能取消**：`_speech_job` 只是不让重复排队，没有做中断。
+- **音频是未压缩 `.wav`**（约 2.5 MB/分钟）。要小体积得加 MP3 编码器，那就不是「无第三方依赖」了。
+
+---
+
+## 2026-09-28 行内强调解析：两处「记号露源码」的修复
+
+起因是重出说明书长图时，图上明晃晃写着四个星号。顺着查下去发现**同一段代码里有两个独立的坑**，
+而且都是「不报错、只是画错」，靠人眼看长图才能发现。
+
+### 坑一：判「这段强调能不能用」时把内容也算进去了
+
+`_inline_spans` / `_tag_inline` 里，行内代码**先**跑并 claim 掉自己的区间；强调随后跑，
+原来的判据是拿**整个匹配区间** `start..end`（含内容）去比 `blocked`：
+
+```python
+if blocked(start, end):      # ← 整段比
+    continue
+```
+
+于是 `**未压缩的 \`.wav\`**` 整段失效——行内代码 claim 了 `.wav`，加粗的区间跟它重叠，
+加粗被丢掉，**四个星号原样留在正文里**。
+
+改成**只看那两对记号**：
+
+```python
+if any(blocked(left, right) for left, right in
+       ((start, inner[0]), (inner[1], end)) if right > left):
+```
+
+| 写法 | 改前 | 改后 |
+| --- | --- | --- |
+| `**未压缩的 \`.wav\`**，体积不小…` | `('文件是**未压缩的 ', …)` + `('**，体积不小…', …)` | `('文件是', …)` `('未压缩的 ', bold)` `('.wav', code)` `('，体积不小…', …)` |
+
+### 坑二：`finditer` 不重叠，反引号里的 `**` 会「吃掉」后面真那对记号
+
+修完坑一，长图上**还有**两处漏星号。这次的反例是说明书自己写的：
+
+```
+- **念的是正文，不是 Markdown 源码**：`#`、`- `、`1. `、`> `、`**`、反引号这些记号都不会念出来；
+  表格按行念…分隔线跳过。**屏幕上看到的、长图里排的、耳朵里听的，是同一套文字**。
+```
+
+`finditer` 的第一段匹配正常。第二段**从反引号里那个当例子写的 `**` 开头**，
+把后面「真的加粗」那对星号当成自己的**收尾**：
+
+```
+match (11, 28) '**`、后面还有 **真的加粗**'   inner '`、后面还有 **真的加粗'
+```
+
+这段匹配的开头落在代码区间里 → 整段丢掉，而**真正的那对加粗从没被匹配过**。
+修法是**被挡下时从 `start + 1` 重新搜**（`search` + 手动推进），退回到真正的那个开头：
+
+```python
+search_from = 0
+while True:
+    match = pattern.search(line, search_from)
+    if match is None: break
+    start, end = match.span()
+    inner = (match.start(1), match.end(1))
+    if any(blocked(left, right) for left, right in
+           ((start, inner[0]), (inner[1], end)) if right > left):
+        search_from = start + 1      # ← 只跳过这个开头，别丢掉整段
+        continue
+    apply(tag, inner, (start, end))
+    search_from = end
+```
+
+两处修法在 `_inline_spans`（导出长图 / 音频）和 `_tag_inline`（编辑区）里**必须一字不差**，
+注释里互相点名——否则同一行文字在屏幕上一个样、导出的长图另一个样。
+
+### 坑三（**不修**）：跨源行的行内记号
+
+说明书里还有两处是**我自己写错了**：加粗的 `**` 开头和结尾被写在了两个源行上。
+实测（`probe_split.py`）：编辑器与导出**两边都**把 `**` 原样显示——
+
+```
+line 1: syntax 记号 = ['- ']   该行文字 = '- 前缀**把第一行的'
+line 2: syntax 记号 = []       该行文字 = '  存盘后文件名就跟着改了**（见说明）。'
+bold 标签范围 = ()
+导出侧： bullet [('前缀**把第一行的', False), ('存盘后文件名就跟着改了**（见说明）。', False)]
+```
+
+**屏幕和长图是一致的**，所以这**不是**导出链路的 bug，而是解析器本来就**逐行**工作
+（增量高亮按行做，这是设计前提）。既然一致，就不能去改 `_append_continuation`
+把合并后的段落重解析——那会让「屏幕上看到的、长图里排的、耳朵里听的，是同一套文字」
+这条自己刚写进说明书的不变量当场失效。
+
+所以这一条**只改文档**：
+
+1. 把说明书那两处改成「记号开闭在同一行」，折行交给显示；
+2. 在「补充说明」里**明写这条规则**（用户会遇到，之前没写）。
+
+> 顺带发现：说明书里用双反引号写 `` `代码` `` 会露反引号——`INLINE_CODE_RE` 只认单反引号
+> （`` `([^`\n]+?)` ``）。改成「行内代码（反引号）」这种说法绕开，没有为它加语法。
+
+### 加了两道机器闸
+
+- `tests/test_export.py::InlineStyleTests`：坑一、坑二各钉几条（`**a*b*c**` 整段加粗、
+  `` `**` `` 不吃后面那对、`*a**b**c*` 里层加粗外层星号当正文…）。
+- `tests/test_export.py::InlineParityTests`：**不建 `Tk` 也不建整个 App**——
+  `_tag_inline` 只用到 `self.editor.tag_add` / `self._tag_syntax` / `self._line_marks` 三样，
+  用一个 `_FakeEditor` + `_TagHarness` 就够，于是没有图形界面的机器上也跑得动。
+  逐行比对两边产出的**样式区间**和**记号区间**，`_tag_inline` 与 `_inline_spans` 再也漂不开。
+- `tests/test_export.py::GuideMarkupTests`：**直接渲染说明书**，正文（非代码）里不许出现
+  `**`/`~~`/`==`/反引号；另外扫源文件，剔掉行内代码后 `**`、`~~`、`==` 必须成对出现在同一行。
+  这两个用例**验过不是空转**：拿改前的两处文本喂进去，正好报 4 行。
+
+### 本轮验证
+
+- 全量测试 **761 项 OK**（338.6 s）。上一轮 745 项，本轮净增 16：`InlineStyleTests` 7+3、
+  `InlineParityTests` 3、`GuideMarkupTests` 3。
+- 说明书长图重出：1080×31480 + 1080×29200，共 2 张；**渲染后的 360 个 Row 里 0 处记号泄漏**
+  （扫描脚本按 `background == CODE_BG` 排掉代码内容）。
+- 三处改动点逐张裁图肉眼确认：`屏幕上看到的…是同一套文字。` 整段深红加粗、
+  `未压缩的 `.wav`` 加粗里套代码、新增的「行内记号要开闭在同一行里」一条，都不露记号。

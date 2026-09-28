@@ -50,10 +50,15 @@
 ## 核验必须在**用户真实设置**下做（踩得很惨）
 
 - 设置现读 `%LOCALAPPDATA%\JianJi\state.json`（本机 `line_width 50 / font_size 18 / line_height 34 /
-  Microsoft YaHei UI / sort_key modified / theme light`；`DEFAULT_SETTINGS` 是 `50/15/22/name`）。
-  **`line_width` 用户会自己调（60→50），别写死**——探针原样读 `settings` 就行。
+  霞鹜文楷 / sort_key modified / theme light`；`DEFAULT_SETTINGS` 是 `50/15/22/name`）。
+  **这几个值用户会自己调**（`line_width` 60→50、字体从微软雅黑换成霞鹜文楷都发生过），
+  所以**别照抄这一行，现读文件**——探针原样读 `settings` 就行。
   **探针要把用户 `settings` 原样写进临时 state.json 再构造 `JianJiApp`**（设置只在启动时读一次）；
   **测试要覆盖非默认设置**（`TallLineHeightWrappedLineGeometryTests` 的 `SETTINGS` 钩子）。
+- **`SCALE` 由 `main` 在导入时算出来（本机 1.5，150% 缩放），且它会钉住整个进程的 `tk scaling`**：
+  必须在**任何 `Tk()` 之前** `import main`（它顺带声明进程 DPI 感知）。顺序反了 `tk scaling`
+  会停在 1.332 而不是 1.998，`_current_pad` 80→48、徽标画布压根不放置、折行填充率 0.971→0.898，
+  **后面所有量几何的用例一起红**。踩过一次（见「技能都没收的坑」）。
 - **判据里不要出现绝对像素**，一律相对设置项（`px(line_height)`）写。
 - 用户的 `state.json` 与文档文件夹都别写（核验用临时 state.json；`set_folder()` 只在文件夹里没 `.md` 时才建文稿）。
 - 探针三坑：`mark_set` 后必须显式跑 `_refresh_cursor_line()`；「光标在别处」停在**紧邻目标行的普通正文行**
@@ -163,6 +168,34 @@
 - 审计后仍**故意留着**的「伪冗余」：`_card_index_at(self, x, y)` 的 `x`（横向不参与判定）、
   Tk 回调的 `_event` / `_args` 参数。**别再当垃圾删**。
 
+## 2026-09-28 加的三样（文件名 / 音频 / 列表缩进）
+
+- **文件名跟随一级标题**：`first_h1_title(text)` + `title_to_filename(title)` + `JianJiApp._follow_title()`，
+  入口只在 `save_now()` 里（正文落盘**之后**改名，改名失败不丢内容）。
+  **只有标题相对载入时真的被改过才改名**——基准点是 `self._title_at_load`，由 `_load_editor_text`
+  从正文第一行取、`_clear_editor` 清空。**别改成「一存盘就按 H1 改名」**：用户文稿里
+  `2026-09-13.md` 与 `2026-09-14.md` 的 H1 都是 `# 今日日记`（照 H1 改会当场撞车）、
+  `开发记录.md` 的 H1 是 `# 简记优化记录`、`说明书/简记使用说明.md` 的 H1 是 `# 简记 · 使用说明`——
+  这些名字是用户自己起的。只认**第一行**；标题清空/第一行不是 H1 → 保持原名。
+  禁字符 `\ / : * ? " < > |` 换**全角同形字**（删掉会把 `第1章/第2节` 粘成 `第1章第2节`）；
+  保留设备名看**第一个点之前**那段（`NUL.md` 一样保留，下划线要插进那一段 → `NUL_.md`）；
+  截断 `FILENAME_MAX_CHARS = 80`；撞名走 `unique_path`。
+  **改名会牵连两条老路径**：`move_document_to` / `delete_document` 都是「先 `save_now` 再拿手里的
+  `path` 去干活」，改名后那个 `path` 已经不存在 → 必须 `if was_current: path = self.current_path`。
+  核验 `tools/_probe_title_rename.py`（27 项）+ `tests/test_title_rename.py`。
+- **导出音频**：`app/speech.py` 是**纯 ctypes 驱动 SAPI**（`SAPI.SpVoice` + `SAPI.SpFileStream`，
+  `IDispatch` 晚绑定，不走 PowerShell / .NET，无第三方依赖），入口 `JianJiApp.export_audio()`，
+  菜单项在 `_doc_menu`。念的文本走 `speakable_text()`，**复用 `build_export_rows`**——
+  屏幕/长图/耳朵必须是同一套解析，记号一个都不许漏（漏了会被念成「井号」「星号」）。
+  合成很慢（中文 ≈3.5 字/秒）→ **后台线程 + 主线程 `root.after` 轮询**（`_speech_job` / `_speech_poll`，
+  已在 `_cancel_after_jobs` 里登记）。**系统默认音色本来就是中文**（`Microsoft Huihui Desktop`），
+  所以不做音色选择；`default_voice_name()` 读注册表。踩坑全在 `speech.py` 的模块 docstring 里。
+- **列表缩进 Tab/Shift+Tab**：`LIST_MAX_LEVEL = 4`（5 级）**模型早就支持**，缺的只是按键绑定。
+  `_shift_list_level(delta)` 按 `LIST_INDENT_STEP = 2` 重写行首缩进（**必须和 `_indent_level` 的
+  `空格数 // 2` 一致**）。`_on_editor_tab` 按**「范围内有没有列表行」**分派，**不能按「有没有移动」**——
+  第 4 级再按 Tab 什么都没动，会掉进「插入两个空格」那个分支。Tk 的 `<Tab>` 默认插 `\t`，
+  而 `\t` 被 `_indent_level` 算成 4 空格 = 2 级，所以必须拦下来返回 `"break"`。
+
 ## 三块大实现（细节在技能里，这里只留落点）
 
 - **增量重解析**：打字先走 `_apply_markdown_styles_incremental()`，`False` 才退回整篇；**两条路径共用 `_style_line`**。
@@ -180,6 +213,19 @@
     **有意留的余量，别改成按 `span` 卡**——会把一张装得下的文档切成两张。量法 `tools/_probe_chunks.py`。
   - **别再拿「行宽太窄」当解释去收边距**：1080px + 32px 正文 ⇒ 每行最多 **33 个汉字**（要边距收到 12px）；
     实测边距 72→12 只把短尾巴从 45 处降到 41 处，**基本没用**。要少折行只能加宽画布或缩字号。
+  - **行内强调的两条判据**（`_inline_spans` 与 `_tag_inline` **必须一字不差**，注释里互相点名）：
+    ① 判「这段强调能不能用」**只看那两对记号**，不看内容——拿整个 `start..end` 去比 `blocked`，会让
+    `**未压缩的 \`.wav\`**` 整段失效（行内代码先 claim 了 `.wav`），四个星号露在图上；
+    ② 强调循环**用 `search` + 手动推进，不用 `finditer`**——`finditer` 匹配不重叠，反引号里当例子写的
+    `**` 会**开启**一段匹配、把后面真那对星号当收尾，那段又因开头落在代码区间里被丢掉，
+    于是**真的那对加粗从没被匹配过**。被挡下时 `search_from = start + 1`（不是 `match.end()`）。
+    验证：`InlineStyleTests`、`InlineParityTests`（`_FakeEditor` + `_TagHarness`，不建 Tk）、`GuideMarkupTests`。
+  - **行内记号必须开闭在同一源行**（解析器逐行工作，增量高亮的前提）。跨行的话**屏幕、长图、音频三处
+    一致地**把 `**` 原样显示——所以**别去改 `_append_continuation` 重解析合并后的段落**，那会打破
+    「屏幕 / 长图 / 音频同一套文字」这条不变量。这是**写文档的规则**，已写进说明书「补充说明」。
+    写说明书时自己别踩：`GuideMarkupTests` 会渲染整篇 + 扫源文件把落单的 `**`/`~~`/`==` 揪出来。
+  - `INLINE_CODE_RE` **只认单反引号**（`` `([^`\n]+?)` ``）：说明书里用双反引号写 `` `代码` `` 会露反引号。
+    写「反引号」三个字绕开，别为它加语法。
   - **正文像素字号 `DEFAULT_BODY_SIZE = 46` = 一行正好 20 个汉字**（用户要求）。汉字在这几款中文字体里的
     **步进正好等于字号**（实测三款字体、字号 32 → 单字宽 32px），所以
     `一行几个字 = (1080 − 72×2) ÷ 字号 = 936 ÷ 46 = 20.35`，20 字 920px 放得进、21 字 966px 放不进。
@@ -218,3 +264,11 @@
 - **`end-1c` 是最后一个真字符**，末尾那个 `\n` 是 Tk 幻影换行：`get("end-3c","end")` 会比正文多一个 `\n`，
   `delete("end-1c")` 删的是最后一个真字符。**想造「末尾没有换行」的状态就直接 `insert` 原始正文**，
   别「载入完再删一个字符」（会静默删掉正文里的「。」）。
+- **`import main` 必须排在第一次 `Tk()` 之前**（`main` 导入时声明进程 DPI 感知，而 Tk 在第一次 `Tk()` 时
+  按当时的 DPI 定 `tk scaling`）。顺序反了 `tk scaling` = 1.332 而不是 1.998，`_current_pad` 80→48、
+  徽标画布**压根不放置**、折行填充率 0.971→0.898——**后面所有量几何的用例一起红**，而且单独跑那些模块全绿，
+  极难定位。测试侧的兜底在 `tools/run_tests.py` 的 `run_in_process()`（发现测试模块之前先 `import main`）；
+  复现 `tools/_probe_scale_order.py`。**别把这道兜底删了**，也别在测试模块里把模块级探针写到 `import main` 前面。
+- **`time.sleep` / 轮询循环里千万别等模态框**：隐藏桌面上没人能点「确定」，会一直挂到被杀，
+  而且**日志一个字都没有**（子进程 stdout 是块缓冲，`-u` 或 `flush=True` 才有输出）。
+  探针里要把 `messagebox` 换成记录器（`tools/_probe_title_rename.py` 有现成写法）。

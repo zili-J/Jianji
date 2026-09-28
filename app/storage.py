@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,48 @@ from typing import Any
 
 class ExternalChangeError(RuntimeError):
     """Raised when a file changed on disk after it was loaded."""
+
+
+#: `os.replace` 在这几个 Windows 错误码上值得重试。它们都不是「文件坏了」或
+#: 「没有权限」，而是**别人正好拿着**：杀毒软件刚扫到、索引器在读、云盘客户端
+#: 还没放开。Windows 自己给 `ReplaceFile`/`MoveFileEx` 的建议也是重试。
+_TRANSIENT_REPLACE_WINERRORS = frozenset({
+    5,    # ERROR_ACCESS_DENIED    —— 拒绝访问
+    32,   # ERROR_SHARING_VIOLATION —— 共享冲突
+    33,   # ERROR_LOCK_VIOLATION    —— 锁冲突
+})
+_REPLACE_ATTEMPTS = 6
+_REPLACE_DELAY = 0.08          # 秒；每次翻倍式加长，总共最多等约 1.2 秒
+
+
+def replace_with_retry(source: Path, target: Path) -> None:
+    """`os.replace` 的一层薄重试，专治 Windows 上的**瞬时**占用。
+
+    为什么需要它：用户的日记文件夹在 `文档` 下面，而 `文档` 常常被 OneDrive 之类的
+    云盘同步；杀毒软件也会在文件刚写完的那一刻扫一遍。那一瞬间 `os.replace` 抛
+    `PermissionError: [WinError 5] 拒绝访问`——**和「真的没有写权限」报的是同一个
+    异常**，可实际上零点几秒之后就没事了。不重试的话，用户会看到一个「保存失败」
+    的对话框，而他什么都没做错。
+
+    这不是纸上推演：一次全量测试里 `save_state()` 就在 `%TEMP%` 下抛了 WinError 5，
+    单独重跑同一个模块 10 项全绿——典型的瞬时占用。
+
+    **只重试上面那三个错误码**。别的错误（磁盘满、路径不存在、真的是只读文件）
+    立刻原样抛出去，免得把真问题拖成六次无谓的等待。
+    """
+    last: OSError | None = None
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except OSError as error:
+            if getattr(error, "winerror", None) not in _TRANSIENT_REPLACE_WINERRORS:
+                raise
+            last = error
+            if attempt + 1 < _REPLACE_ATTEMPTS:
+                time.sleep(_REPLACE_DELAY * (attempt + 1))
+    assert last is not None                     # 循环里必然赋过值
+    raise last
 
 
 @dataclass(frozen=True)
@@ -61,7 +104,7 @@ def atomic_write_markdown(
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        replace_with_retry(temp_path, path)
         temp_path = None
     finally:
         if temp_path is not None and temp_path.exists():
@@ -202,7 +245,8 @@ def move_to_folder(path: Path, target_dir: Path, root: Path) -> Path:
 
     target = unique_path(target_dir, source.name)
     # 同一个文件夹内改名，os.replace 是原子的；失败就让它抛出去，不做半吊子处理
-    os.replace(source, target)
+    # （重试只针对「别人正好拿着」那三个瞬时错误，见 replace_with_retry）
+    replace_with_retry(source, target)
     return target
 
 
@@ -306,7 +350,7 @@ def move_to_trash(path: Path, root: Path, now: datetime | None = None) -> TrashE
         target = folder / trash_name
         counter += 1
 
-    os.replace(source, target)
+    replace_with_retry(source, target)
     index = _load_trash_index(root)
     index[trash_name] = {"original": relative.as_posix(), "deleted_at": stamp}
     _save_trash_index(root, index)
@@ -342,7 +386,7 @@ def restore_from_trash(root: Path, trash_name: str) -> Path:
         while target.exists():
             target = target.with_name(f"{target.stem}-还原{counter}{target.suffix}")
             counter += 1
-    os.replace(source, target)
+    replace_with_retry(source, target)
     index.pop(trash_name, None)
     _save_trash_index(root, index)
     return target
@@ -396,7 +440,7 @@ def save_state(value: dict[str, Any], path: Path | None = None) -> None:
     payload = json.dumps(value, ensure_ascii=False, indent=2)
     temp = target.with_suffix(".tmp")
     temp.write_text(payload, encoding="utf-8")
-    os.replace(temp, target)
+    replace_with_retry(temp, target)
 
 
 def get_default_folder(path: Path | None = None) -> Path | None:
