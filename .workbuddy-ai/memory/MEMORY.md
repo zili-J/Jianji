@@ -194,17 +194,23 @@
 
 - **文件名跟随一级标题**：`first_h1_title(text)` + `title_to_filename(title)` + `JianJiApp._follow_title()`，
   入口只在 `save_now()` 里（正文落盘**之后**改名，改名失败不丢内容）。
-  **只有标题相对载入时真的被改过才改名**——基准点是 `self._title_at_load`，由 `_load_editor_text`
-  从正文第一行取、`_clear_editor` 清空。**别改成「一存盘就按 H1 改名」**：用户文稿里
-  `2026-09-13.md` 与 `2026-09-14.md` 的 H1 都是 `# 今日日记`（照 H1 改会当场撞车）、
-  `开发记录.md` 的 H1 是 `# 简记优化记录`、`说明书/简记使用说明.md` 的 H1 是 `# 简记 · 使用说明`——
-  这些名字是用户自己起的。只认**第一行**；标题清空/第一行不是 H1 → 保持原名。
+  **判据只有一条：第一行是一级标题、且清出来的名字与现在的文件名主干不同就改**（2026-09-28 晚改的，
+  原来还有一道「标题相对载入变过没有」的门，`_title_at_load` 已删）。
+  **别再改回「只在你改了标题时才改」**：用户文稿里那批 `新建-2026-09-28-160555.md` 全建在改名功能
+  上线之前，H1 早就是 `# All in One 软件思考`、名字一直没跟上；用户把标题重新敲一遍（内容一字未变），
+  旧规则判「没变过」→ 文件名不动，在用户眼里就是「改了标题名字没跟着改」（他报了两次）。
+  **只在存盘时改名**：光打开翻看不写盘，文件名一动不动。只认**第一行**；标题清空/首行不是 H1 → 保持原名。
+  撞名走 `unique_path` → 两篇 `# 今日日记` 落成 `今日日记.md` / `今日日记-2.md`（**不覆盖**）。
   禁字符 `\ / : * ? " < > |` 换**全角同形字**（删掉会把 `第1章/第2节` 粘成 `第1章第2节`）；
   保留设备名看**第一个点之前**那段（`NUL.md` 一样保留，下划线要插进那一段 → `NUL_.md`）；
-  截断 `FILENAME_MAX_CHARS = 80`；撞名走 `unique_path`。
+  截断 `FILENAME_MAX_CHARS = 80`。失败记忆 `_rename_failed_for = (normcase(path), stem)`——
+  **key 里必须带 stem**，否则换个标题也被上次的失败连坐；成功要清成 `None`。
   **改名会牵连两条老路径**：`move_document_to` / `delete_document` 都是「先 `save_now` 再拿手里的
   `path` 去干活」，改名后那个 `path` 已经不存在 → 必须 `if was_current: path = self.current_path`。
-  核验 `tools/_probe_title_rename.py`（27 项）+ `tests/test_title_rename.py`。
+  核验 `tools/_probe_title_rename.py`（10 节端到端）+ `tests/test_title_rename.py`（41 项）。
+  **`tools/_sync_manual.py` 不许再写死说明文件名**：说明书 H1 是 `# 简记 · 使用说明`，用户在软件里
+  动一下就会变成 `简记 · 使用说明.md` → 走 `resolve_stem()`（已存在的那份优先，其次按 H1 推算），
+  并清掉另一种主干留下的孤儿 png。
 - **导出音频**：`app/speech.py` 是**纯 ctypes 驱动 SAPI**（`SAPI.SpVoice` + `SAPI.SpFileStream`，
   `IDispatch` 晚绑定，不走 PowerShell / .NET，无第三方依赖），入口 `JianJiApp.export_audio()`，
   菜单项在 `_doc_menu`。念的文本走 `speakable_text()`，**复用 `build_export_rows`**——

@@ -1348,9 +1348,9 @@ class JianJiApp:
         self.folder: Path | None = None
         self.current_path: Path | None = None
         self.disk_signature: FileSignature | None = None
-        # 载入这篇文稿时的一级标题。存盘时拿它跟当前标题比，**只有真的改过才改名**
-        # （见 `_follow_title`）——不然第一次保存就会把用户自己起的老名字整片换掉。
-        self._title_at_load: str | None = None
+        # 上一次改名失败的 (规范化路径, 目标主干)。同一个文件往同一个目标改失败过就
+        # 不再重试，免得每次自动保存都弹一遍「改名失败」（见 `_follow_title`）。
+        self._rename_failed_for: tuple[str, str] | None = None
         self.dirty = False
         self.save_job: str | None = None
         self.settings_job: str | None = None
@@ -3820,14 +3820,11 @@ class JianJiApp:
             self.editor.mark_set("insert", cursor)
         self.editor.edit_reset()
         self.editor.edit_modified(False)
-        # 「载入时的标题」的基准点。存盘时靠它判断标题有没有被改过（见 `_follow_title`），
-        # 所以必须跟着正文一起重置——主题重建时也会走这里，那时正文没变，基准点照旧。
-        self._title_at_load = first_h1_title(text)
 
     def _clear_editor(self) -> None:
         self.current_path = None
         self.disk_signature = None
-        self._title_at_load = None
+        self._rename_failed_for = None
         self.preview_mode = False
         self.dirty = False
         if self.save_job:
@@ -3946,11 +3943,20 @@ class JianJiApp:
     def _follow_title(self, path: Path, text: str) -> Path:
         """存盘后让文件名跟随一级标题，返回改名后的路径（没改就原样返回）。
 
-        **只有标题真的被改过才改名**（拿 `_title_at_load` 比）。不卡这一道，第一次
-        保存就会把老文稿整片改名，而用户文稿里现成的反例一抓一把：
-        `2026-09-13.md` 与 `2026-09-14.md` 的 H1 都是 `# 今日日记`（照 H1 改名会当场
-        撞车）、`开发记录.md` 的 H1 是 `# 简记优化记录`、`说明书/简记使用说明.md` 的
-        H1 是 `# 简记 · 使用说明`。这些名字是用户自己起的，不该被软件悄悄换掉。
+        **判据只有一条：第一行是一级标题，且它清出来的文件名主干与现在的不同就改。**
+        不看「标题相对载入时有没有变过」——那条更严的规则漏掉了一种真实情况：
+
+            新建文稿的文件名是 `新建-2026-09-28-160555.md`，首行是占位标题
+            `# 新建文档`。用户改成 `# All in One 软件思考`，存盘后名字跟上了。
+            可要是**改名这个功能比文稿来得晚**（本功能 2026-09-28 才上线，用户文件夹里
+            那批 `新建-*` 就是在那之前建的），这些文稿的名字与标题一直是错位的。
+            用户再打开它们、把标题重新敲一遍——按「相对载入变没变」判，标题没变，
+            文件名就不动，用户看到的就是「我改了标题，文件名没跟着改」。
+
+        所以规则就一句话：**第一行是一级标题、且清出来的名字与现在的不一样，就改。**
+        代价是打开一篇名字与标题本来就不一致的老文稿、动一下正文，名字也会被扶正——
+        这正是要的效果（文件名＝一级标题），而且只在**存盘**时发生：光翻看不改，
+        一个字都不会落盘，也就不会动任何文件名。
 
         重名走 `unique_path` 加 `-2`、`-3`，**绝不覆盖**别人的文件。
 
@@ -3959,16 +3965,17 @@ class JianJiApp:
         一个都没变，所以外部改动监测不会误报。
 
         改名失败只提示一句、不动任何状态：正文已经存进去了，没什么可丢的，
-        不值得弹个错误框吓人。
+        不值得弹个错误框吓人。同一个文件往同一个目标失败过就不再试（`_rename_failed_for`），
+        否则每次自动保存都会再提示一遍。
         """
         title = first_h1_title(text)
-        if title is None or title == self._title_at_load:
+        if title is None:
             return path
         stem = title_to_filename(title)
-        # 先把这个标题认下来：即便下面清不出合法文件名、或者改名失败，
-        # 也不再拿同一个标题反复试、反复弹提示
-        self._title_at_load = title
         if stem is None or stem == path.stem:
+            return path
+        key = (os.path.normcase(str(path)), stem)
+        if self._rename_failed_for == key:
             return path
         target = path.with_name(f"{stem}{path.suffix}")
         if target.exists():
@@ -3979,8 +3986,10 @@ class JianJiApp:
         try:
             replace_with_retry(path, target)
         except OSError:
+            self._rename_failed_for = key
             self.status_label.configure(text="改名失败，文件名保持不变")
             return path
+        self._rename_failed_for = None
         self.status_label.configure(text=f"已改名为：{target.name}")
         return target
 

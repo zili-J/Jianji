@@ -1,20 +1,25 @@
 """文件名跟随一级标题：标题识别、文件名清洗、以及「什么时候才该改名」。
 
-这一批里最要紧的不是「能改名」，而是**不该改名的时候不改**。用户文稿里现成的
-反例一抓一把：
+规则只有一条：**第一行是一级标题，且它清出来的名字与现在的文件名不一样，就改。**
+不看「相对载入有没有变过」——那条更严的规则会漏掉一种真实情况。用户文稿里躺着一批
+`新建-2026-09-28-160555.md` 这样的名字，首行标题却是 `# All in One 软件思考`：它们
+建在「文件名跟随标题」这个功能上线之前，名字与标题一直是错位的。用户再打开它们、
+把标题重新敲一遍，按「相对载入变没变」判标题没变、文件名就不动，看起来就是
+「我改了标题，文件名没跟着改」。
 
-  · `2026-09-13.md` 与 `2026-09-14.md` 的 H1 都是 `# 今日日记`；
-  · `开发记录.md` 的 H1 是 `# 简记优化记录`；
-  · `说明书/简记使用说明.md` 的 H1 是 `# 简记 · 使用说明`。
+所以这一批里最要紧的是三件事：
 
-要是「一存盘就按 H1 改名」，第一次保存就会把这一片名字全换掉，前两个还当场撞车。
-所以规则是**只有标题相对载入时真的被改过才改名**（`_title_at_load` 是基准点）。
+  · **该改的时候真改**——只动正文也能把错位的名字扶正；
+  · **不该改的时候别乱改**——第一行不是一级标题、标题清完为空，名字都一动不动；
+  · **撞名绝不覆盖**——`2026-09-13.md` 与 `2026-09-14.md` 的 H1 都是 `# 今日日记`，
+    先后改过来会落成 `今日日记.md` 与 `今日日记-2.md`，两份正文都在。
 
 另外两条被改名牵连的路径也要盯着：`move_document_to` / `delete_document` 都是
 「先 `save_now` 再拿手里的 path 去干活」，改名会让那个 path 指向一个不存在的名字。
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -156,6 +161,9 @@ class TitleRenameUiTests(unittest.TestCase):
             "# 简记优化记录\n\n这一篇名字是用户自己起的。\n", encoding="utf-8")
         (folder / "无标题.md").write_text(
             "第一行不是标题。\n\n# 后面才有标题\n", encoding="utf-8")
+        # 建在「文件名跟随标题」上线之前的那种名字：标题早就是自己的了，名字还是新建时的
+        (folder / "新建-2026-09-28-160555.md").write_text(
+            "# All in One 软件思考\n\n这一篇建在改名功能上线之前。\n", encoding="utf-8")
         storage.set_default_folder(folder)
         self.folder = folder
 
@@ -203,63 +211,49 @@ class TitleRenameUiTests(unittest.TestCase):
     def _names(self) -> set[str]:
         return {path.name for path in self.folder.glob("*.md")}
 
-    # ---- 载入时的基准点 ----
+    # ---- 光翻看不改：一个字都不该落盘 ----
 
-    def test_the_title_is_captured_when_the_document_is_loaded(self) -> None:
-        self._open("2026-09-13.md")
-        self.assertEqual(self.app._title_at_load, "今日日记")
-
-    def test_a_document_without_a_leading_heading_has_no_baseline(self) -> None:
-        self._open("无标题.md")
-        self.assertIsNone(self.app._title_at_load)
-
-    # ---- 不该改名的时候 ----
-
-    def test_editing_only_the_body_never_renames(self) -> None:
-        """名字跟 H1 对不上是常态，用户自己起的名字不该被软件换掉。"""
-        for name in ("2026-09-13.md", "开发记录.md"):
-            with self.subTest(name=name):
-                before = self._names()
-                self._open(name)
-                self._touch_body()
-                self.assertTrue(self._flush())
-                self.assertEqual(self.app.current_path.name, name)
-                self.assertEqual(self._names(), before)
-
-    def test_two_documents_sharing_one_title_both_keep_their_names(self) -> None:
-        """两篇日记的 H1 都是 `# 今日日记`——照 H1 改名会当场撞车。"""
-        for name in ("2026-09-13.md", "2026-09-14.md"):
-            self._open(name)
-            self._touch_body()
-            self._flush()
-        self.assertTrue((self.folder / "2026-09-13.md").is_file())
-        self.assertTrue((self.folder / "2026-09-14.md").is_file())
-        self.assertFalse((self.folder / "今日日记.md").exists())
-        self.assertFalse((self.folder / "今日日记-2.md").exists())
-
-    def test_clearing_the_title_keeps_the_file_name(self) -> None:
-        """标题被删空时保住原名，总比把文件叫成 `.md` 强。"""
-        self._open("2026-09-13.md")
-        self._set_first_line("# ")
-        self.assertTrue(self._flush())
-        self.assertEqual(self.app.current_path.name, "2026-09-13.md")
-        self.assertTrue(self.app.current_path.is_file())
-
-    def test_a_heading_on_a_later_line_does_not_rename(self) -> None:
-        self._open("无标题.md")
-        self._touch_body()
-        self._flush()
-        self.assertEqual(self.app.current_path.name, "无标题.md")
-
-    def test_a_title_matching_the_current_name_is_a_no_op(self) -> None:
-        """`开发记录.md` 的 H1 改成 `# 开发记录`：名字已经对了，不必动盘。"""
+    def test_opening_a_document_never_touches_its_name(self) -> None:
+        """改名只在**存盘**时发生。只是打开翻看，不写文件、也不动名字。"""
+        before = self._names()
         self._open("开发记录.md")
-        self._set_first_line("# 开发记录")
-        self.assertTrue(self._flush())
-        self.assertEqual(self.app.current_path.name, "开发记录.md")
-        self.assertEqual(self._names() & {"开发记录-2.md"}, set())
+        self._open("2026-09-13.md")
+        self._open("新建-2026-09-28-160555.md")
+        self.assertEqual(self._names(), before)
 
-    # ---- 该改名的时候 ----
+    # ---- 该改名的时候：名字与一级标题对不上 ----
+
+    def test_editing_only_the_body_fixes_a_mismatched_name(self) -> None:
+        """名字与 H1 对不上时，动一下正文就把名字扶正。
+
+        这是「文件名＝一级标题」这条规则的代价，也正是要的效果：软件不再替用户
+        判断「这个名字是不是你自己起的」。
+        """
+        self._open("开发记录.md")
+        self._touch_body()
+        self.assertTrue(self._flush())
+        renamed = self.folder / "简记优化记录.md"
+        self.assertEqual(self.app.current_path, renamed)
+        self.assertTrue(renamed.is_file())
+        self.assertFalse((self.folder / "开发记录.md").exists(), "旧名字不该留着")
+        self.assertIn("这一篇名字是用户自己起的。", renamed.read_text(encoding="utf-8"))
+
+    def test_an_old_document_gets_its_name_fixed_without_editing_the_title(self) -> None:
+        """用户报的那一条：老文稿的名字与标题错位，把标题重新敲一遍也该扶正。
+
+        `新建-2026-09-28-160555.md` 建在「文件名跟随标题」上线之前，首行标题
+        `# All in One 软件思考` 一直没反映到文件名上。用户把标题重新敲一遍——
+        内容一字未变——旧规则判「相对载入没变过」，文件名纹丝不动，于是看起来
+        就是「我改了标题，文件名没跟着改」。这里把那条路径钉住。
+        """
+        self._open("新建-2026-09-28-160555.md")
+        self._set_first_line("# All in One 软件思考")       # 与载入时一字不差
+        self.assertTrue(self._flush())
+
+        renamed = self.folder / "All in One 软件思考.md"
+        self.assertEqual(self.app.current_path, renamed)
+        self.assertFalse((self.folder / "新建-2026-09-28-160555.md").exists())
+        self.assertIn("这一篇建在改名功能上线之前。", renamed.read_text(encoding="utf-8"))
 
     def test_editing_the_title_renames_the_file(self) -> None:
         self._open("2026-09-13.md")
@@ -273,6 +267,24 @@ class TitleRenameUiTests(unittest.TestCase):
         self.assertIn("今天把留白那件事收尾了。", renamed.read_text(encoding="utf-8"),
                       "正文不能丢")
         self.assertIn("今天想通了", self.app.status_label.cget("text"))
+
+    def test_two_documents_sharing_one_title_are_numbered_not_overwritten(self) -> None:
+        """两篇日记的 H1 都是 `# 今日日记`：先后落成 今日日记.md 与 今日日记-2.md，
+        两份正文都在，谁也没被覆盖。"""
+        self._open("2026-09-13.md")
+        self._touch_body()
+        self.assertTrue(self._flush())
+        self.assertEqual(self.app.current_path.name, "今日日记.md")
+
+        self._open("2026-09-14.md")
+        self._touch_body()
+        self.assertTrue(self._flush())
+        self.assertEqual(self.app.current_path.name, "今日日记-2.md")
+
+        self.assertIn("今天把留白那件事收尾了。",
+                      (self.folder / "今日日记.md").read_text(encoding="utf-8"))
+        self.assertIn("另一天的日记，标题跟上面一模一样。",
+                      (self.folder / "今日日记-2.md").read_text(encoding="utf-8"))
 
     def test_the_renamed_document_stays_open_and_editable(self) -> None:
         self._open("2026-09-13.md")
@@ -298,12 +310,6 @@ class TitleRenameUiTests(unittest.TestCase):
         self.assertIn(self.app.current_path, self.app.file_paths)
         self.assertNotIn(self.folder / "2026-09-13.md", self.app.file_paths)
 
-    def test_the_new_title_becomes_the_baseline(self) -> None:
-        self._open("2026-09-13.md")
-        self._set_first_line("# 今天想通了")
-        self._flush()
-        self.assertEqual(self.app._title_at_load, "今天想通了")
-
     def test_illegal_characters_are_sanitized(self) -> None:
         self._open("2026-09-13.md")
         self._set_first_line("# 第1章/第2节: 真的吗?")
@@ -328,6 +334,7 @@ class TitleRenameUiTests(unittest.TestCase):
         self._set_first_line("# 换名字了")
         self._open("开发记录.md")                     # open_file 里会 _finish_pending_edit
         self.assertTrue((self.folder / "换名字了.md").is_file())
+        # 只是打开、还没存盘，所以切过去的那一篇名字照旧（改名只发生在存盘时）
         self.assertEqual(self.app.current_path.name, "开发记录.md")
 
     def test_a_new_document_takes_its_title_as_the_name(self) -> None:
@@ -345,6 +352,38 @@ class TitleRenameUiTests(unittest.TestCase):
         self.assertFalse(created.exists())
         self.assertEqual(self.app.current_path, renamed)
 
+    # ---- 不该改名的时候 ----
+
+    def test_clearing_the_title_keeps_the_file_name(self) -> None:
+        """标题被删空时保住原名，总比把文件叫成 `.md` 强。"""
+        self._open("2026-09-13.md")
+        self._set_first_line("# ")
+        self.assertTrue(self._flush())
+        self.assertEqual(self.app.current_path.name, "2026-09-13.md")
+        self.assertTrue(self.app.current_path.is_file())
+
+    def test_a_heading_on_a_later_line_does_not_rename(self) -> None:
+        """`# 后面才有标题` 在第三行——不算标题，名字不动。"""
+        self._open("无标题.md")
+        self._touch_body()
+        self._flush()
+        self.assertEqual(self.app.current_path.name, "无标题.md")
+
+    def test_a_title_matching_the_current_name_is_a_no_op(self) -> None:
+        """`开发记录.md` 的 H1 改成 `# 开发记录`：名字已经对了，不必动盘。"""
+        self._open("开发记录.md")
+        self._set_first_line("# 开发记录")
+        self.assertTrue(self._flush())
+        self.assertEqual(self.app.current_path.name, "开发记录.md")
+        self.assertEqual(self._names() & {"开发记录-2.md"}, set())
+
+    def test_a_title_whose_cleaned_name_is_empty_keeps_the_file_name(self) -> None:
+        """标题只剩一串句点，清完为空——保住原名，别造出 `.md`。"""
+        self._open("2026-09-13.md")
+        self._set_first_line("# ...")
+        self.assertTrue(self._flush())
+        self.assertEqual(self.app.current_path.name, "2026-09-13.md")
+
     # ---- 改名失败 ----
 
     def test_a_failed_rename_keeps_the_file_name_and_says_so(self) -> None:
@@ -356,11 +395,32 @@ class TitleRenameUiTests(unittest.TestCase):
         self.assertIn("改名失败", self.app.status_label.cget("text"))
 
     def test_a_failed_rename_does_not_try_the_same_title_again(self) -> None:
-        """失败也算认下了这个标题，免得每次自动保存都再试一遍、再提示一遍。"""
+        """失败记一笔，同一个文件往同一个目标不再重试、也不再改写状态栏。"""
         self._open("2026-09-13.md")
         ghost = self.folder / "不存在的文件夹" / "2026-09-13.md"
         self.app._follow_title(ghost, "# 今天想通了")
-        self.assertEqual(self.app._title_at_load, "今天想通了")
+        self.assertEqual(self.app._rename_failed_for,
+                         (os.path.normcase(str(ghost)), "今天想通了"))
+
+        self.app.status_label.configure(text="")
+        self.assertEqual(self.app._follow_title(ghost, "# 今天想通了"), ghost)
+        self.assertEqual(self.app.status_label.cget("text"), "", "第二次该悄悄放过")
+
+    def test_a_failed_rename_still_allows_a_different_target(self) -> None:
+        """换个标题（换个目标名字）要能重新试，别被上一次的失败连坐。"""
+        self._open("2026-09-13.md")
+        ghost = self.folder / "不存在的文件夹" / "2026-09-13.md"
+        self.app._follow_title(ghost, "# 今天想通了")
+        self.app._follow_title(ghost, "# 明天再想")
+        self.assertEqual(self.app._rename_failed_for,
+                         (os.path.normcase(str(ghost)), "明天再想"))
+
+    def test_a_successful_rename_forgets_an_earlier_failure(self) -> None:
+        self._open("2026-09-13.md")
+        self.app._rename_failed_for = ("随便", "随便")
+        self._set_first_line("# 今天想通了")
+        self.assertTrue(self._flush())
+        self.assertIsNone(self.app._rename_failed_for)
 
     # ---- 改名牵连的两条路径 ----
 
