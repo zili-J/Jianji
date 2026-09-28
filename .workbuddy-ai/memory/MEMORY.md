@@ -3,6 +3,20 @@
 > 只留「不照做就会犯错」的约定与落点。细节见 `memory/YYYY-MM-DD.md`、`.3things/build-log.md`、
 > 技能 `tk-text-incremental-highlight`（Tk 硬约束全清单）、`long-image-export`、`quiet-desktop-gui-run`。
 
+## 备份 / 远端
+
+- 远端 `origin` = `https://github.com/zili-J/Jianji.git`。**备份入口是双击 `push_backup.cmd`**
+  （工程根，纯 ASCII + `chcp 65001`，先打印远端/分支/待推提交再 `git push -u origin <当前分支>`）。
+- **沙箱里推不上去**：环境全局设了 `GIT_TERMINAL_PROMPT=0`；显式打开后
+  `git credential-manager get` 会**超时挂住**（GCM 的登录窗弹不出来）；
+  有时整个进程树被 **SIGTERM 硬杀**（连 `echo` 都不执行）——那是沙箱级 kill，别当 git 错误查。
+  本机 Windows 凭据管理器里没有 github.com 条目，所以**认证必须在用户自己的窗口里点一次**；
+  点过之后凭据进凭据管理器，助手也就能直接推了。
+- **`.cmd` / `.bat` 必须是 CRLF**（`.gitattributes` 里 `*.cmd text eol=crlf`，**排在 `*` 之后**）。
+  `* text=auto eol=lf` 会连入口文件一起转成 LF，cmd.exe 对 LF 批处理容忍度有限
+  （`goto :label` 会失效）。**改属性后要手动把工作区文件转回 CRLF**——git 只在检出时改写。
+  判据 `git ls-files --eol <file>` = `i/lf  w/crlf  attr/text eol=crlf`。
+
 ## 交付物 / 运行 / 测试
 
 - 给用户看的文档写进**文档文件夹**（`state.json` 的 `default_folder`，本机 `C:\Users\22910\Documents\wb01`），
