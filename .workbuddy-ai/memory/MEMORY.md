@@ -31,6 +31,14 @@
   **不写工程根目录**（根目录 `.md` 会让文件夹树混进 `app`/`tools`/`tests`）。
 - **使用说明每次更新都同步到 `C:\Users\22910\Documents\wb01\说明书\` 并重出长图**（用户固定要求）：
   `python tools/quiet_desktop.py <python 全路径> tools/_sync_manual.py`。
+  **要改说明书改 `<工程根>/简记使用说明.md`**——`说明书\` 里那份是**产物**，
+  同步时会被原样覆盖（踩过一次：改了产物，白改）。同步脚本现在会先打印谁是源、谁是产物，
+  并在「副本比源新、内容又不同」时警告。
+- **原子写盘会把创建时间冲掉**：`atomic_write_markdown` 是「临时文件 + `os.replace`」，
+  而 Windows 上那是**用源文件顶掉目标文件**，目标文件连创建时间都变成保存时刻。
+  修之前用户 12 篇文稿的 `st_ctime` **全部等于** `st_mtime`（「按创建时间排序」因此等于按修改时间）。
+  现在每次替换后用 ctypes `SetFileTime` 把旧创建时间写回（`storage.set_creation_time`，best-effort）。
+  **别再把这步删掉**，删了「创建日期」会静默退化成假的。
 - **`简记使用说明.md` 是测试基准文件，不是普通文档**：`tests/test_export.py::EditorParityTests`
   拿它整篇做「编辑器 vs 导出」逐行对账，并断言它**覆盖全部 10 种块级语法**
   （`heading/text/blank/bullet/ordered/task/quote/code/hr/table`）。重写它必须保留这 10 种。

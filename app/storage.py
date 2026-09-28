@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -58,6 +59,97 @@ def replace_with_retry(source: Path, target: Path) -> None:
     raise last
 
 
+# --------------------------------------------------------------- 保留创建时间
+#
+# 保存走的是「写临时文件 + `os.replace`」。Windows 上 `os.replace` 是**用源文件
+# 顶掉目标文件**，于是目标文件整个被换成了临时文件 —— 连创建时间也变成临时文件的
+# 创建时间，也就是「这一次保存的时刻」。
+#
+# 后果不是理论推演，是实测：用户文件夹里 12 篇文稿，`st_ctime` **全部等于** `st_mtime`。
+# 这会让两件事同时失效：
+#
+#   · 「创建日期」永远显示成修改日期，等于没这个信息；
+#   · 「按创建时间排序」与「按修改时间排序」结果完全一样。
+#
+# 所以每次替换之后，把替换前的创建时间写回去。标准库没有「设置创建时间」的接口
+# （`os.utime` 只能改访问时间和修改时间），只能 ctypes 直接调 `SetFileTime`。
+#
+# 注意：**这只能救回「从今往后」的创建时间**。已经丢掉的没法从文件系统上找回，
+# 因为替换掉的旧文件对象已经不存在了。
+
+_FILETIME_EPOCH = 11_644_473_600   # 1601-01-01 → 1970-01-01 的秒数
+_GENERIC_WRITE = 0x40000000
+_FILE_SHARE_ALL = 0x00000007       # READ | WRITE | DELETE，别把别人的句柄挤掉
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x80
+
+_kernel32: Any = None              # 惰性加载；`False` 表示「试过了，这台机器上没有」
+
+
+def _load_kernel32():
+    """拿到配好原型的 kernel32。非 Windows 或加载失败返回 None。"""
+    global _kernel32
+    if _kernel32 is None:
+        try:
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # `CreateFileW` 返回的是句柄，**必须显式声明 `restype`**：ctypes 默认
+            # 按 32 位 int 处理返回值，句柄高位被砍掉，接着就是一个无效句柄。
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            kernel32.SetFileTime.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+                ctypes.c_void_p, ctypes.c_void_p,
+            ]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            _kernel32 = kernel32
+        except (ImportError, AttributeError, OSError, ValueError):
+            _kernel32 = False
+    return _kernel32 or None
+
+
+def creation_time(path: Path) -> float | None:
+    """文件的**创建**时间；拿不到返回 None。
+
+    Windows 上 `st_ctime` 就是创建时间（POSIX 上它是元数据变更时间，语义不同，
+    所以那边直接返回 None，不假装自己有这个信息）。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        return path.stat().st_ctime
+    except OSError:
+        return None
+
+
+def set_creation_time(path: Path, timestamp: float) -> bool:
+    """把创建时间写回文件。**best-effort**：失败返回 False，绝不打断保存。
+
+    创建时间是给人看的信息，为它让保存失败不划算。
+    """
+    if os.name != "nt":
+        return False
+    kernel32 = _load_kernel32()
+    if kernel32 is None:
+        return False
+    from ctypes import wintypes
+    ticks = int(timestamp * 10_000_000) + _FILETIME_EPOCH * 10_000_000
+    created = wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
+    handle = kernel32.CreateFileW(
+        str(path), _GENERIC_WRITE, _FILE_SHARE_ALL, None,
+        _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
+    )
+    if handle == ctypes.c_void_p(-1).value:      # INVALID_HANDLE_VALUE
+        return False
+    try:
+        return bool(kernel32.SetFileTime(handle, ctypes.byref(created), None, None))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 @dataclass(frozen=True)
 class FileSignature:
     modified_ns: int
@@ -95,6 +187,8 @@ def atomic_write_markdown(
         raise ExternalChangeError(f"File changed outside JianJi: {path}")
 
     payload = text.encode("utf-8")
+    # 替换会把创建时间冲掉，先把它记下来（见上面「保留创建时间」一节）。
+    previous_created = creation_time(path)
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -109,6 +203,9 @@ def atomic_write_markdown(
     finally:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink()
+
+    if previous_created is not None:
+        set_creation_time(path, previous_created)
 
     saved = signature(path)
     if saved is None:

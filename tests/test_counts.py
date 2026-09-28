@@ -1,28 +1,33 @@
-"""顶栏的字数 / 字符数：计数规则，以及「只在鼠标经过时显示」。
+"""顶栏的字数 / 字符数 / 创建与修改时间：计数规则，以及「只在鼠标经过时显示」。
 
 用户要求：「增加字数显示。显示在专注模式标识所在行，且只在鼠标经过时显示，
 显示两个内容，字数和字符数。」
+后来又要求：「加入文档的创建日期和修改日期，显示逻辑与字数一致。」
 
-这一组守三件事：
+这一组守四件事：
 
 ① **两个数各算各的**——字数回答「我写了多少东西」（标点、Markdown 记号不计），
    字符数回答「这篇正文有多长」（除换行外全算）；
 ② **平时不占位置**，指针经过顶栏那一行才出来，离开就收回去；
 ③ **指针在顶栏内部挪动时不能一闪一闪**——Tk 在父控件与子控件之间也会发
-   `<Leave>`，所以判据是按指针位置算的，不是收到 `<Leave>` 就藏。
+   `<Leave>`，所以判据是按指针位置算的，不是收到 `<Leave>` 就藏；
+④ **创建/修改时间与字数共用同一条显示规则**，且没落盘的文稿不编造时间。
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
+import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "app"))
 
 import storage  # noqa: E402
-from main import document_counts  # noqa: E402
+from main import document_counts, document_timestamps, format_moment  # noqa: E402
 
 import tkinter as tk  # noqa: E402
 
@@ -89,6 +94,54 @@ class DocumentCountTests(unittest.TestCase):
             words, characters = document_counts(text)
             self.assertGreaterEqual(words, 0)
             self.assertGreaterEqual(characters, 0)
+
+
+class DocumentMomentTests(unittest.TestCase):
+    """创建 / 修改时间：取值口径与格式化（纯函数，没有图形环境也能跑）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_no_path_means_no_timestamps(self) -> None:
+        """还没落盘的文稿没有时间可显示——不能编一个出来。"""
+        self.assertIsNone(document_timestamps(None))
+
+    def test_a_missing_file_means_no_timestamps(self) -> None:
+        """文件刚被删掉/正在被移走时也不能崩，顶栏少显示两项就是了。"""
+        self.assertIsNone(document_timestamps(self.tmp / "没有这个文件.md"))
+
+    def test_a_real_file_gives_back_both_stamps(self) -> None:
+        path = self.tmp / "a.md"
+        storage.atomic_write_markdown(path, "正文", None)
+        stamps = document_timestamps(path)
+        self.assertIsNotNone(stamps)
+        created, modified = stamps
+        info = path.stat()
+        self.assertAlmostEqual(created, info.st_ctime, delta=0.001)
+        self.assertAlmostEqual(modified, info.st_mtime, delta=0.001)
+
+    def test_the_creation_stamp_comes_from_the_filesystem_not_from_now(self) -> None:
+        """创建时间取的是文件上那个戳，不是「此刻」。"""
+        path = self.tmp / "a.md"
+        storage.atomic_write_markdown(path, "正文", None)
+        old = time.time() - 5 * 86400
+        storage.set_creation_time(path, old)
+        created, _ = document_timestamps(path)
+        self.assertAlmostEqual(created, old, delta=1.0)
+
+    def test_the_format_is_compact_and_stable(self) -> None:
+        """不能用 `%c` 之类：中文系统会给出带「星期一」的长串，宽度还随星期几变。"""
+        text = format_moment(time.time())
+        self.assertRegex(text, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertEqual(len(text), 16)
+
+    def test_it_renders_the_local_moment(self) -> None:
+        stamp = datetime(2026, 9, 28, 16, 5).timestamp()
+        self.assertEqual(format_moment(stamp), "2026-09-28 16:05")
+
+    def test_midnight_does_not_lose_leading_zeros(self) -> None:
+        stamp = datetime(2026, 1, 2, 3, 4).timestamp()
+        self.assertEqual(format_moment(stamp), "2026-01-02 03:04")
 
 
 @unittest.skipUnless(HAS_DISPLAY, "需要图形界面环境")
@@ -182,6 +235,91 @@ class TopBarCountsTests(unittest.TestCase):
             self.app._on_editor_modified()
         self.root.update()
         self.assertNotEqual(self.app.count_label.cget("text"), before)
+
+    # ---- 创建 / 修改时间：和字数同一条显示规则 ----
+
+    def test_it_shows_both_times(self) -> None:
+        self._open_doc()
+        self._hover()
+        text = self.app.count_label.cget("text")
+        self.assertIn("创建", text)
+        self.assertIn("修改", text)
+
+    def test_the_times_are_the_real_ones_from_disk(self) -> None:
+        self._open_doc()
+        self._hover()
+        info = self.doc.stat()
+        text = self.app.count_label.cget("text")
+        self.assertIn(format_moment(info.st_ctime), text)
+        self.assertIn(format_moment(info.st_mtime), text)
+
+    def test_an_unsaved_document_shows_no_times(self) -> None:
+        """还没落盘就没有时间可显示，这时只显示字数——**不编造**。"""
+        self.app.current_path = None
+        self.app.editor.configure(state="normal")
+        self.app.editor.delete("1.0", "end")
+        self.app.editor.insert("1.0", "还没保存的正文。")
+        self.app._show_counts()
+        self.root.update()
+        text = self.app.count_label.cget("text")
+        self.assertIn("字数", text)
+        self.assertNotIn("创建", text)
+        self.assertNotIn("修改", text)
+
+    def test_the_times_are_hidden_along_with_the_numbers(self) -> None:
+        """平时整句都不显示——时间不能自己冒出来占位置。"""
+        self._open_doc()
+        self.assertFalse(self.app.count_label.winfo_ismapped())
+
+    def test_the_modification_time_follows_a_save(self) -> None:
+        # 把修改时间挪到三天前，「保存后变新」在**分钟**粒度上才看得出来
+        old = time.time() - 3 * 86400
+        os.utime(self.doc, (old, old))
+        self._open_doc()
+        self._hover()
+        self.assertIn(format_moment(old), self.app.count_label.cget("text"))
+        self.app.editor.insert("end-1c", "补一句。")
+        self.root.update()
+        self.app.save_now()
+        self.root.update()
+        self.assertNotIn(format_moment(old), self.app.count_label.cget("text"))
+
+    def test_saving_does_not_reset_the_creation_time(self) -> None:
+        """这条是整件事的命门：原子写盘曾把创建时间冲成保存时刻。
+
+        真出现过——用户文件夹里 12 篇文稿的创建时间**全部等于**修改时间，
+        「创建日期」等于没有。见 `storage.atomic_write_markdown`。
+        """
+        old = time.time() - 30 * 86400
+        storage.set_creation_time(self.doc, old)
+        self._open_doc()
+        self._hover()
+        self.assertIn(format_moment(old), self.app.count_label.cget("text"))
+        self.app.editor.insert("end-1c", "再写一句。")
+        self.root.update()
+        self.app.save_now()
+        self.root.update()
+        self.assertIn(format_moment(old), self.app.count_label.cget("text"),
+                      "保存把创建时间冲掉了")
+
+    def test_switching_documents_updates_the_times(self) -> None:
+        other = self.doc.with_name("另一篇.md")
+        other.write_text("# 另一篇\n\n正文。\n", encoding="utf-8")
+        storage.set_creation_time(other, time.time() - 10 * 86400)
+        self._open_doc()
+        self._hover()
+        self.app.open_file(other)
+        self.root.update()
+        self.assertIn(format_moment(other.stat().st_ctime),
+                      self.app.count_label.cget("text"))
+
+    def test_clearing_the_editor_takes_the_row_away(self) -> None:
+        """清空文稿后那一句不能还挂着（指针停在顶栏上时清空的情形）。"""
+        self._open_doc()
+        self._hover()
+        self.app._clear_editor()
+        self.root.update()
+        self.assertFalse(self.app.count_label.winfo_ismapped())
 
     # ---- 什么时候收回去 ----
 

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 
@@ -35,6 +36,7 @@ from storage import (
     conflict_copy_path,
     count_files,
     create_folder,
+    creation_time,
     default_journal_folder,
     delete_to_recycle_bin,
     get_default_folder,
@@ -1376,6 +1378,36 @@ def document_counts(text: str) -> tuple[int, int]:
     return words, max(0, characters)
 
 
+#: 顶栏里创建/修改时间的格式。**不用 `%c` 之类**：中文系统会给出带「星期一」的长串，
+#: 宽度还随星期几变化，顶栏会跟着一抖一抖。
+MOMENT_FORMAT = "%Y-%m-%d %H:%M"
+
+
+def format_moment(timestamp: float) -> str:
+    """把时间戳格式化成顶栏上那句 `2026-09-28 16:05`。"""
+    return datetime.fromtimestamp(timestamp).strftime(MOMENT_FORMAT)
+
+
+def document_timestamps(path: Path | None) -> tuple[float, float] | None:
+    """文稿的 `(创建时间, 修改时间)`；拿不到就返回 `None`。
+
+    「哪个字段才算创建时间」交给 `storage.creation_time()` 判断——那里写着**为什么
+    Windows 上看 `st_ctime`、为什么别的平台宁可不显示**。这里只负责把两个戳凑齐。
+
+    没有落盘的文稿（`path is None`）和读不到的文件（刚被删、正在被移走）都返回
+    `None`：顶栏少显示两项，总比为了显示时间把界面搞崩强。
+    """
+    if path is None:
+        return None
+    created = creation_time(path)
+    if created is None:
+        return None
+    try:
+        return created, path.stat().st_mtime
+    except OSError:
+        return None
+
+
 class JianJiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -1627,7 +1659,7 @@ class JianJiApp:
         )
         self.status_label.grid(row=0, column=0, sticky="w", pady=px(13))
 
-        # 字数 / 字符数：和「专注模式」同一行，**平时完全不占位置**，
+        # 字数 / 字符数 / 创建与修改时间：和「专注模式」同一行，**平时完全不占位置**，
         # 鼠标经过这一行时才冒出来（见 `_on_topbar_enter` / `_on_topbar_leave`）。
         # 用 `grid_remove()` 而不是 `grid_forget()`：前者把 grid 参数留着，
         # 再 `grid()` 一下就能原样回到第 1 列，不用每次重报一遍坐标。
@@ -1966,7 +1998,7 @@ class JianJiApp:
         if self.focus_mode:
             self.toggle_focus()
 
-    # ---------- 顶栏的字数 / 字符数 ----------
+    # ---------- 顶栏的字数 / 字符数 / 时间 ----------
 
     def _on_topbar_enter(self, _event=None) -> None:
         if self._counts_job is not None:
@@ -2005,14 +2037,34 @@ class JianJiApp:
         self.count_label.grid_remove()
 
     def _show_counts(self) -> None:
-        """算出字数/字符数并显示。空文稿不显示（没什么可数的）。"""
+        """算出字数/字符数、创建与修改时间并显示。空文稿不显示（没什么可数的）。
+
+        时间与字数**共用同一条显示规则**：同一行、只在鼠标经过顶栏时出现。
+        还没有落盘的文稿没有时间可显示，这时只显示字数和字符数。
+        """
         text = self.editor.get("1.0", "end-1c")
         if not text.strip():
             self.count_label.grid_remove()
             return
         words, characters = document_counts(text)
-        self.count_label.configure(text=f"字数 {words:,} · 字符数 {characters:,}")
+        parts = [f"字数 {words:,}", f"字符数 {characters:,}"]
+        stamps = document_timestamps(self.current_path)
+        if stamps is not None:
+            created, modified = stamps
+            parts.append(f"创建 {format_moment(created)}")
+            parts.append(f"修改 {format_moment(modified)}")
+        self.count_label.configure(text=" · ".join(parts))
         self.count_label.grid()
+
+    def _refresh_counts_if_shown(self) -> None:
+        """顶栏那句正显示着就跟着刷新。
+
+        平时标签是隐藏的，这一句只花一次 `winfo_ismapped()`，不会白算一遍字数。
+        换文稿、存盘之后都要叫一下——不然指针停在顶栏上时，看到的还是上一篇的
+        时间、或者存盘之前的修改时间。
+        """
+        if self.count_label.winfo_ismapped():
+            self._show_counts()
 
     # ---------- 导出长图 ----------
 
@@ -3982,6 +4034,8 @@ class JianJiApp:
         self.editor.delete("1.0", "end")
         self.editor.configure(state="disabled")
         self.status_label.configure(text="")
+        # 没有文稿了，顶栏那句也别再挂着（指针停在顶栏上时清空文稿的情形）。
+        self.count_label.grid_remove()
         self.gutter.delete("all")
 
     # ---------- 文档 ----------
@@ -4047,6 +4101,9 @@ class JianJiApp:
         # 那个事件回来时第一道判据就不成立。这里也必须 force。
         self._apply_bottom_pad(force=True)
         self.editor.focus_set()
+        # 换了文稿，顶栏那句的创建/修改时间要跟着换（指针停在顶栏上时用快捷键
+        # 切文稿的情形；从文稿列表点进来时指针在列表那边，标签本来就收着）。
+        self._refresh_counts_if_shown()
         self.refresh_files(path)
 
     def _on_editor_modified(self, _event=None) -> None:
@@ -4057,8 +4114,7 @@ class JianJiApp:
         self._apply_bottom_pad()
         # 顶栏的字数正显示着就顺手刷新（指针停在顶栏上、人在打字的情形）。
         # 平时标签是隐藏的，这一句只花一次 `winfo_ismapped()`，不用白算一遍字数。
-        if self.count_label.winfo_ismapped():
-            self._show_counts()
+        self._refresh_counts_if_shown()
         if self.current_path is None:
             return
         self.dirty = True
@@ -4090,6 +4146,8 @@ class JianJiApp:
         # 正文落盘之后再改名：万一改名这一步出错，内容也已经安全写进去了
         self.current_path = self._follow_title(self.current_path, text)
         self.refresh_files(self.current_path)
+        # 刚落盘，修改时间变了；顶栏那句正显示着就得跟着走。
+        self._refresh_counts_if_shown()
         return True
 
     def _follow_title(self, path: Path, text: str) -> Path:

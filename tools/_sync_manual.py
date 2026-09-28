@@ -56,11 +56,26 @@ def main() -> int:
         print(f"找不到源文件：{SOURCE}")
         return 1
 
+    # 0) 先把「谁是谁」说清楚。这两份文件看起来都像「说明书」，很容易顺手去改
+    #    `说明书\` 里那一份——那是**产物**，下次同步会被原样覆盖，改动静默丢失。
+    #    （写这个工具的人自己就踩过一次。）
+    print(f"源文件（要改说明书请改这个）：{SOURCE}")
+    print(f"目标（自动生成，别直接改）：  {TARGET_DIR}")
+
     # 1) 同步 Markdown（先落盘，长图从同步后的正文渲染，两者必然一致）
     TARGET_DIR.mkdir(parents=True, exist_ok=True)
     stem = resolve_stem()
     target_md = TARGET_DIR / f"{stem}.md"
     target_png = TARGET_DIR / f"{stem}.png"
+
+    # 1a) 防呆：**副本比源文件新、内容又不一样**，说明有人直接改了副本。
+    #     正常同步完之后副本 mtime 总比源文件新，但那时两者内容相同，所以判据要
+    #     同时看「内容不同」和「副本更新」——单看时间会每次误报。
+    if target_md.exists() and SOURCE.read_bytes() != target_md.read_bytes():
+        if target_md.stat().st_mtime > SOURCE.stat().st_mtime:
+            print(f"⚠ {target_md.name} 比源文件新、内容又不同——像是直接改了副本。")
+            print(f"  这次同步会覆盖它。要保住那些改动，请把它们并进 {SOURCE.name}。")
+
     shutil.copyfile(SOURCE, target_md)
     print(f"已同步 {SOURCE.name} → {target_md}")
 

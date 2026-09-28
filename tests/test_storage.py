@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -262,6 +264,92 @@ class ReplaceWithRetryTests(unittest.TestCase):
         source = inspect.getsource(save_state)
         self.assertIn("replace_with_retry", source)
         self.assertNotIn("os.replace", source)
+
+
+class CreationTimeTests(unittest.TestCase):
+    """原子写盘不能把创建时间冲掉。
+
+    保存走的是「写临时文件 + `os.replace`」。Windows 上那是**用源文件顶掉目标
+    文件**，目标文件连创建时间也一起变成了临时文件的创建时间——也就是这一次
+    保存的时刻。
+
+    这不是纸上推演：修之前，用户文件夹里 12 篇文稿的 `st_ctime` **全部等于**
+    `st_mtime`。后果是「创建日期」永远显示成修改日期，而且「按创建时间排序」
+    与「按修改时间排序」结果完全一样。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.path = self.tmp / "a.md"
+
+    def _backdate_creation(self, days: float = 30.0) -> float:
+        """把创建时间挪到 N 天前，返回那个时间戳。
+
+        比 `time.sleep()` 等时间自然流逝靠谱得多——NTFS 的时间精度虽然到 100ns，
+        但「等一秒再写」在慢机器上照样可能撞上同一秒，判据会飘。
+        """
+        target = time.time() - days * 86400
+        self.assertTrue(storage.set_creation_time(self.path, target),
+                        "这台机器上 SetFileTime 应当可用")
+        return target
+
+    @unittest.skipUnless(os.name == "nt", "创建时间是 Windows 才有的概念")
+    def test_a_second_save_keeps_the_creation_time(self) -> None:
+        atomic_write_markdown(self.path, "第一版", None)
+        target = self._backdate_creation()
+        atomic_write_markdown(self.path, "第二版", storage.signature(self.path))
+        self.assertAlmostEqual(self.path.stat().st_ctime, target, delta=1.0,
+                               msg="保存把创建时间冲成了「现在」")
+
+    @unittest.skipUnless(os.name == "nt", "创建时间是 Windows 才有的概念")
+    def test_the_modification_time_still_advances(self) -> None:
+        """保住创建时间不能顺手把修改时间也冻住——那就本末倒置了。"""
+        atomic_write_markdown(self.path, "第一版", None)
+        before = self.path.stat().st_mtime
+        self._backdate_creation()
+        os.utime(self.path, (before - 60, before - 60))
+        atomic_write_markdown(self.path, "第二版", storage.signature(self.path))
+        self.assertGreater(self.path.stat().st_mtime, before - 60 + 30)
+
+    @unittest.skipUnless(os.name == "nt", "创建时间是 Windows 才有的概念")
+    def test_the_two_timestamps_end_up_different(self) -> None:
+        """这正是用户要看的东西：创建 ≠ 修改。修之前它们永远相等。"""
+        atomic_write_markdown(self.path, "第一版", None)
+        target = self._backdate_creation()
+        atomic_write_markdown(self.path, "第二版", storage.signature(self.path))
+        info = self.path.stat()
+        self.assertAlmostEqual(info.st_ctime, target, delta=1.0)
+        self.assertGreater(info.st_mtime - info.st_ctime, 86400)
+
+    @unittest.skipUnless(os.name == "nt", "创建时间是 Windows 才有的概念")
+    def test_renaming_keeps_the_creation_time(self) -> None:
+        """改名走的是同一条 `replace_with_retry`，也不能把创建时间弄丢。"""
+        atomic_write_markdown(self.path, "正文", None)
+        target = self._backdate_creation()
+        renamed = self.tmp / "b.md"
+        replace_with_retry(self.path, renamed)
+        self.assertAlmostEqual(renamed.stat().st_ctime, target, delta=1.0)
+
+    def test_a_brand_new_file_gets_the_current_time(self) -> None:
+        """新建的文稿没有「旧创建时间」可保，就应该是现在——别被写成 0。"""
+        before = time.time()
+        atomic_write_markdown(self.path, "正文", None)
+        self.assertAlmostEqual(storage.creation_time(self.path), before, delta=30)
+
+    def test_creation_time_of_a_missing_file_is_none(self) -> None:
+        self.assertIsNone(storage.creation_time(self.tmp / "没有这个文件.md"))
+
+    def test_setting_the_time_on_a_missing_file_fails_quietly(self) -> None:
+        """best-effort：拿不到句柄就返回 False，**不能抛异常打断保存**。"""
+        self.assertFalse(storage.set_creation_time(self.tmp / "没有这个文件.md", 0.0))
+
+    def test_the_save_path_does_not_swallow_the_preservation(self) -> None:
+        """守住「以后别把这段删了」——删了功能会静默退化成假的。"""
+        import inspect
+
+        source = inspect.getsource(atomic_write_markdown)
+        self.assertIn("creation_time", source)
+        self.assertIn("set_creation_time", source)
 
 
 if __name__ == "__main__":
