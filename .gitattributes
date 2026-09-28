@@ -1,0 +1,17 @@
+# 全仓库统一用 LF。
+#
+# 起因：有 7 个文本文件是 CRLF（在 Windows 上新建时带的），和其余文件不一致。
+# 行尾混用会让 diff 整片变色、`git blame` 失效，也容易在「按行比对」的脚本里踩坑。
+# `eol=lf` 让**工作区**也是 LF，不只是仓库里存 LF —— 否则检出后又是 CRLF，
+# 本地脚本读到的还是两套行尾。
+* text=auto eol=lf
+
+# 二进制：交给 git 原样处理，别做行尾转换（转了文件就坏了）
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.wav binary
+*.mp3 binary
