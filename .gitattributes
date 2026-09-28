@@ -6,6 +6,15 @@
 # 本地脚本读到的还是两套行尾。
 * text=auto eol=lf
 
+# **例外：Windows 批处理必须是 CRLF。**
+#
+# 上面那条 `eol=lf` 会把 `.cmd` 也改成 LF —— 这正是上一版踩的坑：`run_jianji.cmd`
+# 是用户双击的入口，被悄悄转成了 LF。cmd.exe 对 LF 结尾的批处理容忍度有限
+# （`goto :label` 这类会直接失效），入口文件不能赌这个。
+# 所以这两行必须排在 `*` 后面（gitattributes 后匹配的规则覆盖先匹配的）。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
 # 二进制：交给 git 原样处理，别做行尾转换（转了文件就坏了）
 *.png binary
 *.jpg binary
