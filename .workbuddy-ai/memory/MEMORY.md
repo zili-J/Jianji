@@ -131,6 +131,14 @@
   光标落在序号画布下。修法在 `_style_line` 有序分支：`body_empty and line_number == cursor_line` 时把**行尾空格
   留在 elide 之外**（`marker_end -= 1`）。**别再改成「画布整体左移」**（被撤掉的写法）。
 - **顶部栏（编辑状态 + 专注模式）常显**（`grid_propagate(False)`）。「自动收起」被撤回（连编辑状态一起没了）。
+  **中间那个字数是悬停才显示的**（`count_label` 在 `column=1`，初始 `grid_remove()`——**别用
+  `grid_forget()`**，前者留着 grid 参数，`grid()` 一下就能回原位）。判据**不能看 `<Enter>/<Leave>`
+  事件**：指针从 topbar 挪到它自己的子控件上时 topbar 也会收到 `<Leave>`，当场隐藏会闪。
+  正确做法是 `_on_topbar_leave` 排一个 `after(COUNT_HIDE_DELAY_MS)`，到点用
+  `_pointer_is_on_topbar()`（`winfo_containing` + 往上找 `master`）算真实位置。topbar 和它的
+  **三个子控件都要绑**。`_counts_job` 要进 `_cancel_after_jobs`，`_rebuild_ui` 里也要显式取消。
+  两个数：`document_counts()`（模块级纯函数）→ 字数 = 中日韩逐字 + 西文按词（标点/记号不计），
+  字符数 = 除换行外全部字符。
 - **粗体/斜体走暖色**（`BOLD_COLOR #B3261E`、`ITALIC_COLOR #A87514`）。改色要**三处一起**：编辑器标签、
   `export_palette()`、`image_export.Palette` 默认值。测试按**色相角差 + 相对亮度差**判。
 - **深色主题**：`apply_theme(name)` 把颜色常量 `globals().update()` 再 `_rebuild_ui()` 整块重建；`THEMES["light"]`
@@ -300,3 +308,22 @@
 - **`time.sleep` / 轮询循环里千万别等模态框**：隐藏桌面上没人能点「确定」，会一直挂到被杀，
   而且**日志一个字都没有**（子进程 stdout 是块缓冲，`-u` 或 `flush=True` 才有输出）。
   探针里要把 `messagebox` 换成记录器（`tools/_probe_title_rename.py` 有现成写法）。
+
+## 音频导出（SAPI / ffmpeg）
+
+- **语速只走 `voice.Rate`，绝不放 `<prosody rate>` 进 SSML**。实测 `<prosody rate='0'>` 会让同一段
+  文本从 16.9 秒变成 **50.9 秒**（SAPI 对它的解释和 `voice.Rate = 0` 完全对不上）；两处各设一次还会叠乘。
+  已钉进 `test_the_rate_is_not_put_into_the_ssml`。
+- **让它不机械的杠杆只有节奏**：`speech.build_ssml()` 出带 `<break>` 的 SSML，`Speak` 带
+  `SVSF_IS_XML`(=8)。段间 450ms / 段内换行 260ms / 句末 160ms；**逗号不加**（引擎本来就会停）。
+  语速 `NATURAL_RATE = -1`。`_gap(0)` 返回空串——「关掉停顿」必须真的不留标签，否则对照核验是假的。
+  量法：同段样例带停顿比纯文本长 **+1.15s**（理论 +1.19s）→ 说明 `<break>` 真被执行了。
+  「更自然」没法机器判定，`tools/_probe_audio_naturalness.py` 出 A/B 样音给人听。
+- **本机 SAPI5 只有 `TTS_MS_ZH-CN_HUIHUI_11.0` 一个中文音色**；更自然的 OneCore 音色
+  （`MSTTTS_V110_zhCN_*`）注册在 `Speech_OneCore\Voices`，**SAPI5 看不见**，要管理员权限搬 token。
+- **`shutil.which("ffmpeg")` 找不到 ≠ 没装**：Windows 的 ffmpeg 包解压出来是 `ffmpeg-xxx/bin/ffmpeg.exe`，
+  很多人把**解压目录本身**加进 PATH（本机 `D:\OpenToUseSW\ffmpeg-master-latest-win64-gpl-shared` 就是），
+  于是 `where ffmpeg` 失败但东西就在。`app/ffmpeg.py::_locate()` 会在 PATH 每一层**再往下探一层 `bin\`**。
+- **起外部进程要 `creationflags=CREATE_NO_WINDOW`**（0x08000000），否则闪黑框——这正是
+  `speech.py` 当初绕开外部脚本引擎的原因。转 MP3 是**可选一步**，找不到 ffmpeg 就只提供 WAV。
+  临时 WAV 放 `mkdtemp()`，`finally` 里 `rmtree`；**别放用户选的目录**（中途失败会留下同名垃圾）。

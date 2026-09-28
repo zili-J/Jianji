@@ -3,13 +3,16 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 
+import ffmpeg
 import speech
 from image_export import (
     DEFAULT_BODY_SIZE as EXPORT_BODY_SIZE,
@@ -237,8 +240,12 @@ EDITOR_SIDE_RATIO = 0.05        # 编辑区两侧各留的比例（相对屏幕�
 EDITOR_SHARE_HEADROOM = 0.10    # 「编辑区占屏幕比例」超出 行宽+这个 才算够宽
 EDITOR_MIN_SHARE = 0.40         # 软件最小宽度：让编辑区至少占屏幕的这个比例
 
-# 顶部栏（左侧编辑状态 + 右侧「专注模式」）高度。常显，不参与自动收起。
+# 顶部栏（左侧编辑状态 + 中间字数 + 右侧「专注模式」）高度。常显，不参与自动收起。
 TOP_BAR_HEIGHT = 46
+
+# 顶栏字数：指针离开顶栏后等这么久再判断「真出去了没有」。
+# 指针在 topbar 与它的子控件之间挪动时 Tk 会发一对 Enter/Leave，不等这一下会闪。
+COUNT_HIDE_DELAY_MS = 60
 
 # 编辑区底部的呼吸空间：滚到底时最后一行下面留出这么多（**视口高度的比例**）。
 # 用户要求 25%。写长文时最后一行贴着窗口下沿很难受，光标停在末尾时连「下一行」
@@ -1342,6 +1349,33 @@ def title_to_filename(title: str) -> str | None:
     return cleaned
 
 
+#: 中日韩文字：每个字算一个「字」。含汉字扩展 A、兼容汉字、日文假名、韩文谚文。
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+                     r"\u3040-\u30ff\uac00-\ud7af]")
+
+#: 西文「词」：连续的字母/数字，中间可以夹撇号或连字符（`don't`、`state-of-the-art`）。
+_LATIN_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['\u2019-][A-Za-z0-9]+)*")
+
+
+def document_counts(text: str) -> tuple[int, int]:
+    """返回 `(字数, 字符数)`，给顶栏那一行鼠标经过时显示用。
+
+    **两个数不是一回事：**
+
+    - **字数**：中日韩文字一个字算一个，连续的英文字母/数字算一个词。
+      标点、空白、Markdown 记号都不计 —— 它回答的是「我写了多少东西」。
+      所以 `# 我的日记` 是 4 个字（那个 `#` 不算），`hello 你好` 是 3 个。
+    - **字符数**：除换行外的**全部字符**，空格和标点都算 —— 它回答的是
+      「这篇正文有多长」。换行是排版结构、不是内容，所以不数（不然一百行的
+      文稿会平白多出一百个）。
+
+    纯函数，不碰 Tk：顶栏那个标签只是把结果拼成一句话。
+    """
+    words = len(_CJK_RE.findall(text)) + len(_LATIN_WORD_RE.findall(text))
+    characters = len(text) - text.count("\n") - text.count("\r")
+    return words, max(0, characters)
+
+
 class JianJiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -1358,6 +1392,8 @@ class JianJiApp:
         # 音频导出在后台线程里跑（合成很慢），主线程只轮询进度
         self._speech_job: dict | None = None
         self._speech_poll: str | None = None
+        # 顶栏字数：指针离开之后延迟一拍再判断「到底出去了没有」（见 `_on_topbar_leave`）
+        self._counts_job: str | None = None
         self.file_paths: list[Path] = []
         self.scope_folder: Path | None = None
         self.trash_mode = False
@@ -1591,6 +1627,17 @@ class JianJiApp:
         )
         self.status_label.grid(row=0, column=0, sticky="w", pady=px(13))
 
+        # 字数 / 字符数：和「专注模式」同一行，**平时完全不占位置**，
+        # 鼠标经过这一行时才冒出来（见 `_on_topbar_enter` / `_on_topbar_leave`）。
+        # 用 `grid_remove()` 而不是 `grid_forget()`：前者把 grid 参数留着，
+        # 再 `grid()` 一下就能原样回到第 1 列，不用每次重报一遍坐标。
+        self.count_label = tk.Label(
+            self.topbar, text="", bg=EDITOR_BG, fg=MUTED, font=(FAMILY, 9), anchor="e",
+            padx=px(10),
+        )
+        self.count_label.grid(row=0, column=1, sticky="e", pady=px(13))
+        self.count_label.grid_remove()
+
         # 「导出长图」不再占顶栏位置，挪到文稿右键菜单里（见 _doc_menu）。
         self.focus_button = tk.Button(
             self.topbar, text="专注模式", command=self.toggle_focus, bg=EDITOR_BG, fg=MUTED,
@@ -1598,6 +1645,14 @@ class JianJiApp:
             borderwidth=0, padx=px(14), pady=px(6), cursor="hand2", font=(FAMILY, 9),
         )
         self.focus_button.grid(row=0, column=2, sticky="e", padx=(0, px(14)))
+
+        # 指针在 topbar 和它的子控件之间挪动时，Tk 会给 topbar 发一对
+        # `<Leave>`/`<Enter>`（**进到子控件里也算「离开父控件」**）。所以这几个
+        # 控件都要绑上，真正的判据放在 `_hide_counts_if_outside` 里按指针位置算。
+        for widget in (self.topbar, self.status_label, self.count_label,
+                       self.focus_button):
+            widget.bind("<Enter>", self._on_topbar_enter, add="+")
+            widget.bind("<Leave>", self._on_topbar_leave, add="+")
 
         editor_holder = tk.Frame(self.editor_panel, bg=EDITOR_BG)
         editor_holder.grid(row=1, column=0, columnspan=3, sticky="nsew")
@@ -1911,6 +1966,54 @@ class JianJiApp:
         if self.focus_mode:
             self.toggle_focus()
 
+    # ---------- 顶栏的字数 / 字符数 ----------
+
+    def _on_topbar_enter(self, _event=None) -> None:
+        if self._counts_job is not None:
+            self.root.after_cancel(self._counts_job)
+            self._counts_job = None
+        self._show_counts()
+
+    def _on_topbar_leave(self, _event=None) -> None:
+        """指针离开顶栏。**不立刻隐藏**——见 `_pointer_is_on_topbar`。"""
+        if self._counts_job is not None:
+            self.root.after_cancel(self._counts_job)
+        self._counts_job = self.root.after(COUNT_HIDE_DELAY_MS,
+                                           self._hide_counts_if_outside)
+
+    def _pointer_is_on_topbar(self) -> bool:
+        """指针现在落在顶栏那一行上吗（含它的子控件）。"""
+        widget = self.root.winfo_containing(self.root.winfo_pointerx(),
+                                            self.root.winfo_pointery())
+        while widget is not None:
+            if widget is self.topbar:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _hide_counts_if_outside(self) -> None:
+        """延迟之后才判断：指针真出去了才隐藏。
+
+        为什么要绕这一下：指针从 topbar 挪到它自己的子控件（状态文字、「专注模式」
+        按钮）上时，Tk 会先给 topbar 发 `<Leave>`。当场隐藏的话，指针只是在那一行
+        里横向移动，字数就会一闪一闪。等 `COUNT_HIDE_DELAY_MS` 之后直接问
+        「指针现在压在哪个控件上」，比自己去追一对对的 Enter/Leave 可靠得多。
+        """
+        self._counts_job = None
+        if self._pointer_is_on_topbar():
+            return
+        self.count_label.grid_remove()
+
+    def _show_counts(self) -> None:
+        """算出字数/字符数并显示。空文稿不显示（没什么可数的）。"""
+        text = self.editor.get("1.0", "end-1c")
+        if not text.strip():
+            self.count_label.grid_remove()
+            return
+        words, characters = document_counts(text)
+        self.count_label.configure(text=f"字数 {words:,} · 字符数 {characters:,}")
+        self.count_label.grid()
+
     # ---------- 导出长图 ----------
 
     def _export_options(self) -> Options:
@@ -2006,19 +2109,27 @@ class JianJiApp:
                 lines.append(line)
         return "\n".join(lines)
 
-    def _export_default_audio_path(self, path: Path | None = None) -> Path:
+    def _export_default_audio_path(self, path: Path | None = None,
+                                   suffix: str = ".wav") -> Path:
         target = self.current_path if path is None else path
         if target is not None:
-            return target.with_suffix(".wav")
+            return target.with_suffix(suffix)
         folder = Path(self.folder) if self.folder else Path.home()
-        return folder / "简记朗读.wav"
+        return folder / f"简记朗读{suffix}"
 
     def export_audio(self, path: Path | None = None) -> None:
-        """把一篇文档念成音频（WAV）。
+        """把一篇文档念成音频（MP3 或 WAV）。
 
         **合成很慢**（中文语速约每秒 3.5 个字），一篇两千字的日记要十来分钟，
         所以放到后台线程里跑、主线程只轮询进度 —— 直接同步调用会把界面冻住，
         用户会以为软件卡死了。状态栏显示已用时间，合成完自动打开文件夹。
+
+        **格式由用户选的文件名决定**（`.mp3` / `.wav`）。MP3 是「先合成 WAV、
+        再让 ffmpeg 转一道」，所以会多一个临时文件；机器上没有 ffmpeg 时就只
+        提供 WAV，其余一切照旧（见 `app/ffmpeg.py`）。
+
+        **念的是带停顿的 SSML**，不是光秃秃的正文（见 `speech.build_ssml`）——
+        这是让它别那么机械的唯一一个不引新依赖的杠杆。
         """
         if self._speech_job is not None:
             self.status_label.configure(text="上一段音频还在合成，请稍候…")
@@ -2038,21 +2149,45 @@ class JianJiApp:
             self.status_label.configure(text="没有内容可以朗读")
             return
 
-        default = self._export_default_audio_path(source)
+        mp3_ready = ffmpeg.is_available()
+        default = self._export_default_audio_path(source, ".mp3" if mp3_ready else ".wav")
+        filetypes = ([("MP3 音频", "*.mp3"), ("WAV 音频", "*.wav")] if mp3_ready
+                     else [("WAV 音频", "*.wav")])
         chosen = filedialog.asksaveasfilename(
-            title="导出音频", parent=self.root, defaultextension=".wav",
+            title="导出音频", parent=self.root,
+            defaultextension=".mp3" if mp3_ready else ".wav",
             initialdir=str(default.parent), initialfile=default.name,
-            filetypes=[("WAV 音频", "*.wav")],
+            filetypes=filetypes,
         )
         if not chosen:
             return
 
         target = Path(chosen)
+        wants_mp3 = target.suffix.lower() == ".mp3"
+        if wants_mp3 and not mp3_ready:
+            messagebox.showerror(
+                "无法导出 MP3",
+                "没有找到 ffmpeg，只能导出 WAV。\n\n"
+                "装好 ffmpeg 并让它出现在 PATH 上（或者用环境变量 "
+                f"{ffmpeg.ENV_VAR} 指到 ffmpeg.exe），重启软件后再试。",
+                parent=self.root)
+            return
+
+        # MP3 要先生成 WAV 再转，中间那个 WAV 放临时目录、转完就删——
+        # 不能放在用户选的目录里，否则中途失败会留下一个他不认识的同名文件
+        work_dir = Path(tempfile.mkdtemp(prefix="jianji-speech-")) if wants_mp3 else None
+        wav_target = (work_dir / f"{target.stem}.wav") if wants_mp3 else target
+
         voice = speech.default_voice_name()
         self._speech_job = {
             "target": target,
+            "wav": wav_target,
+            "work_dir": work_dir,
+            "mp3": wants_mp3,
             "text": spoken,
             "voice": voice,
+            "phase": "speech",
+            "seconds": None,
             "error": None,
             "size": 0,
             "done": False,
@@ -2067,10 +2202,18 @@ class JianJiApp:
         def work() -> None:
             """后台线程：只碰 job 字典和文件，**绝不碰任何 Tk 对象**。"""
             try:
-                job["size"] = speech.synthesize(spoken, target)
+                payload = speech.build_ssml(spoken)
+                job["size"] = speech.synthesize(payload, wav_target,
+                                                rate=speech.NATURAL_RATE, xml=True)
+                job["seconds"] = speech.wav_seconds(wav_target)
+                if wants_mp3:
+                    job["phase"] = "encode"
+                    job["size"] = ffmpeg.to_mp3(wav_target, target)
             except Exception as error:                  # noqa: BLE001
                 job["error"] = error
             finally:
+                if work_dir is not None:
+                    shutil.rmtree(work_dir, ignore_errors=True)
                 job["done"] = True
 
         threading.Thread(target=work, daemon=True, name="jianji-speech").start()
@@ -2084,8 +2227,9 @@ class JianJiApp:
             return
         if not job["done"]:
             elapsed = time.monotonic() - job["started"]
+            doing = "正在转成 MP3…" if job["phase"] == "encode" else "正在合成语音…"
             self.status_label.configure(
-                text=f"正在合成语音…已用 {elapsed:.0f} 秒（长文可能要几分钟）")
+                text=f"{doing}已用 {elapsed:.0f} 秒（长文可能要几分钟）")
             self._speech_poll = self.root.after(300, self._poll_speech_job)
             return
 
@@ -2094,10 +2238,10 @@ class JianJiApp:
         if error is not None:
             self.status_label.configure(text="导出音频失败")
             messagebox.showerror("导出音频失败",
-                                 f"合成语音时出错：\n{error}", parent=self.root)
+                                 f"生成音频时出错：\n{error}", parent=self.root)
             return
         target = job["target"]
-        seconds = speech.wav_seconds(target)
+        seconds = job["seconds"]
         length = f"（约 {seconds:.0f} 秒）" if seconds else ""
         self.status_label.configure(text=f"已导出音频：{target.name}{length}")
         self._reveal(target)
@@ -2972,7 +3116,11 @@ class JianJiApp:
         menu.add_command(label="在资源管理器中显示", command=lambda: self._reveal(path))
         # 导出长图原先在顶栏，现在集中到这里：右键哪一篇就导出哪一篇
         menu.add_command(label="导出长图", command=lambda: self.export_long_image(path))
-        menu.add_command(label="导出音频", command=lambda: self.export_audio(path))
+        # 有 ffmpeg 才把 MP3 摆在前面（它是默认格式）；没有就只提 WAV，
+        # 免得用户点进去才发现存不了
+        audio_label = ("导出音频（MP3 / WAV）" if ffmpeg.is_available()
+                       else "导出音频（WAV）")
+        menu.add_command(label=audio_label, command=lambda: self.export_audio(path))
 
         targets = self._move_targets(path)
         move_menu = tk.Menu(menu, tearoff=0)
@@ -3907,6 +4055,10 @@ class JianJiApp:
         self.editor.edit_modified(False)
         # 末尾换行会把底部留白标签撑到两行上，每次改动都重挂一次
         self._apply_bottom_pad()
+        # 顶栏的字数正显示着就顺手刷新（指针停在顶栏上、人在打字的情形）。
+        # 平时标签是隐藏的，这一句只花一次 `winfo_ismapped()`，不用白算一遍字数。
+        if self.count_label.winfo_ismapped():
+            self._show_counts()
         if self.current_path is None:
             return
         self.dirty = True
@@ -5070,6 +5222,14 @@ class JianJiApp:
         cursor = self.editor.index("insert") if has_document else "1.0"
         scroll = self.editor.yview()[0] if has_document else 0.0
 
+        # 待触发的那次「隐藏字数」还攥着旧 `count_label`，重建后它就是个死控件
+        if self._counts_job is not None:
+            try:
+                self.root.after_cancel(self._counts_job)
+            except tk.TclError:
+                pass
+            self._counts_job = None
+
         # 子窗口也是按旧配色建的，一并销毁（设置窗口由调用方重新开）
         for attribute in ("font_window", "settings_window"):
             window = getattr(self, attribute, None)
@@ -5476,7 +5636,8 @@ class JianJiApp:
         窗口销毁时若还有排期，回调会在解释器销毁后触发，抛出
         `invalid command name "..._persist_settings"` 之类的噪音。
         """
-        for name in ("watch_job", "settings_job", "save_job", "_speech_poll"):
+        for name in ("watch_job", "settings_job", "save_job", "_speech_poll",
+                     "_counts_job"):
             job = getattr(self, name, None)
             if not job:
                 continue

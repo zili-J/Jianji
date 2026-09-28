@@ -3204,3 +3204,128 @@ def resolve_stem() -> str:
   闭在下一行）——这正是上一轮加的那道闸在干活，改成单行后 102 项 OK。
 - 说明书「文件名跟随一级标题」一节按新规则重写，同步到 `Documents\wb01\说明书\`
   并重出长图：**1080×31350 + 1080×30261**（475 行，2 张），两处裁图肉眼确认无记号泄漏。
+
+---
+
+## 三件事：顶栏字数 / 导出 MP3 / 让朗读别那么机械
+
+用户一次提了三件：
+
+> 1. 增加字数显示。显示在专注模式标识所在行，且只在鼠标经过时显示，显示两个内容，字数和字符数。
+> 2. 关于导出音频，我已经按照（安装）ffmpeg，实现导出成 mp3 格式。
+> 3. 现导出的音频较为机械，能否以最简单的方式实现使音频听起来更自然。
+
+### 一、顶栏字数
+
+`document_counts(text) -> (字数, 字符数)` 放在 `main.py` 模块级，**纯函数不碰 Tk**，标签只是
+把结果拼成一句话。两个数的分工写进 docstring 了：
+
+- **字数** = 中日韩文字逐字 + 西文按词（`[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*`）。标点、空白、
+  Markdown 记号都不计 → 回答「我写了多少东西」。
+- **字符数** = 除换行外的全部字符 → 回答「这篇有多长」。换行是排版结构不是内容，
+  不数（不然一百行文稿平白多出一百个）。
+
+标签建在 `topbar` 的 `column=1`（`status_label` 与 `focus_button` 之间），
+初始 `grid_remove()` —— **不用 `grid_forget()`**：前者把 grid 参数留着，`grid()` 一下就能
+原样回到第 1 列。
+
+**「只在鼠标经过时显示」这一条有坑**：Tk 的 `<Enter>`/`<Leave>` 是**按窗口**发的，
+指针从 `topbar` 挪到它自己的子控件（状态文字、「专注模式」按钮）上时，`topbar` 会先收到一个
+`<Leave>` —— 当场隐藏的话，指针只是在那一行里横向移动，字数就会一闪一闪。
+
+所以判据不看事件，看**指针位置**：
+
+```python
+def _on_topbar_leave(self, _event=None):
+    self._counts_job = self.root.after(COUNT_HIDE_DELAY_MS, self._hide_counts_if_outside)
+
+def _hide_counts_if_outside(self):
+    self._counts_job = None
+    if self._pointer_is_on_topbar():        # winfo_containing + 往上找 master
+        return
+    self.count_label.grid_remove()
+```
+
+`topbar` 和它的三个子控件**都要绑** `<Enter>`/`<Leave>`，否则从状态文字挪到按钮上时
+会漏掉进入事件。`_counts_job` 登记进 `_cancel_after_jobs`，并在 `_rebuild_ui` 里显式取消
+（旧 `count_label` 马上要被销毁，待触发的回调会摸到死控件）。
+
+**性能**：标签平时是隐藏的，`_show_counts()` 只在 `<Enter>` 时算一次；`_on_editor_modified`
+里只用一次 `winfo_ismapped()` 判断要不要顺手刷新，不白算。
+
+截图核验（`capture_widget_region` 截 `topbar`，放大 2 倍）：悬停前只有「专注模式」，
+悬停后变成 `字数 61 · 字符数 70    专注模式`，在「退出专注」左边。
+
+### 二、导出 MP3（ffmpeg）
+
+新增 `app/ffmpeg.py`。**这是本项目第一处起外部进程**，模块 docstring 里把理由写清楚了：
+转 MP3 没有纯标准库的办法；它是可选的（找不到就只提供 WAV）；是用户自己装的工具；
+`CREATE_NO_WINDOW` 起进程所以不闪黑框。
+
+**`shutil.which` 不够用**：它只看 PATH 每一层**本身**有没有 `ffmpeg.exe`，而 Windows 的
+ffmpeg 包解压出来是 `ffmpeg-xxx/bin/ffmpeg.exe`。用户这台机器就是这样 —— PATH 里是
+`D:/OpenToUseSW/ffmpeg-master-latest-win64-gpl-shared`（解压目录本身），exe 在它下面的
+`bin\` 里，于是 `where ffmpeg` 找不到，**东西其实就在那儿**。所以 `_locate()` 在 PATH 每一层
+再往下探一层 `bin\`。实测找到了：`D:/OpenToUseSW/.../bin/ffmpeg.exe`。
+
+`find()` 结果**缓存**（导出对话框会连着问两次 `is_available()`）；另给 `_reset_cache()`。
+
+流程：选了 `.mp3` → 合成到 `tempfile.mkdtemp()` 里的临时 WAV → `ffmpeg -codec:a libmp3lame
+-q:a 2 -map_metadata -1` → `shutil.rmtree` 清掉临时目录（放 `finally`，转码失败也清）。
+**临时 WAV 不能放在用户选的目录里**，否则中途失败会留下一个他不认识的同名文件。
+
+`-map_metadata -1` 是必须的：不加会把输入文件的元数据带进 MP3，播放器里显示一串临时文件名。
+
+实测：814 KB WAV → 145 KB MP3。
+
+### 三、让它别那么机械
+
+**先查清楚有哪些杠杆**：本机 SAPI5 能看见的中文音色**只有一个**
+（`TTS_MS_ZH-CN_HUIHUI_11.0`），所以音色这一侧没得调。Win10/11 那套更自然的 OneCore 音色
+（`MSTTTS_V110_zhCN_HuihuiM / KangkangM / YaoyaoM`）注册在
+`HKLM\SOFTWARE\Microsoft\Speech_OneCore\Voices`，**SAPI5 看不见**，要搬 token 进 SAPI5 的
+注册表项才认 —— 那是要管理员权限的一次性改造，没做。
+
+所以剩下的杠杆就是**节奏**：`build_ssml()` 把正文转成带 `<break>` 的 SSML，
+`Speak` 带 `SVSF_IS_XML`(=8) 走 XML 解析。停顿照着 `speakable_text()` 的结构来：
+
+| 正文里的位置 | 停顿 |
+| --- | --- |
+| 空行（段落之间） | 450 ms |
+| 段内单换行（列表项） | 260 ms |
+| `。！？；…` 之后 | 160 ms |
+| 逗号、顿号之后 | **不加**（引擎本来就会停，再加会把句子切碎） |
+
+语速走 `voice.Rate = NATURAL_RATE = -1`（降一档）。
+
+**踩到一个大坑：`<prosody rate>` 不能放进 SSML。** 第一版探针把语速写在
+`<prosody rate='0'>` 里，同一段文本（纯文本 16.9 秒）变成了 **50.9 秒** ——
+SAPI 对 `rate='0'` 的解释和 `voice.Rate = 0` 完全对不上。所以语速**只走 `voice.Rate`**，
+两个地方各设一次还会叠乘。这条已经钉进 `test_the_rate_is_not_put_into_the_ssml`。
+
+**停顿真的生效了**（这是能机器验证的部分）：同一段样例，纯文本 18.91 秒，
+带停顿 20.06 秒，**多出 1.15 秒**；按常量推算（450 + 3×160 + 260 = 1190 ms）应当多 1.19 秒。
+差 0.04 秒 —— 说明 `<break>` 是被引擎执行的，不是被当成文本念出来。
+
+**「更自然」没法机器判定**，所以另给了 `tools/_probe_audio_naturalness.py`：同一段文字出两个
+MP3（`plain.mp3` 旧行为 / `natural.mp3` 新行为），摆进 `outputs/audio-demo/` 让人自己听。
+实测样例：31.6 秒 → 36.6 秒（+5.0 秒 = 停顿 + 降的那一档）。
+
+顺带把 `build_ssml` 的一个真 bug 修了：`paragraph_break_ms=0` 时原本还会吐
+`<break time='0ms'/>`。对 SAPI 确实是空操作（时长一模一样），但会让「关掉停顿做对照」这条
+核验变成假的 —— 字符串里还看得见 `<break`，分不清是没生效还是没关掉。
+现在 `_gap(0)` 返回空串，**关就是关**。
+
+### 本轮验证
+
+- 全量 **820 项 OK**（372.8 s，上轮 763，净增 57：`test_counts.py` 26 项、`test_audio_export.py`
+  加 22 项，另外把 `AudioExportTests` 的替身抽成 `_ExportHarness` mixin——原来
+  `AudioExportTests(SpeakableTextTests)` 这种继承会让父类用例在子类里再跑一遍）。
+- `tools/_probe_audio_naturalness.py` 出样音；`_try_ssml2.py` 量停顿（+1.15s vs 理论 +1.19s）。
+- 顶栏三张截图（不悬停 / 悬停 / 专注模式下）肉眼确认。
+- 说明书两节按新行为重写，同步到 `Documents\wb01\说明书\` 并重出长图
+  （1080×31116 + 1080×31478 + 1080×1971，487 行，3 张）。
+- **上一轮给 `_sync_manual.py` 加的 `resolve_stem()` 当场派上用场**：这次同步时它发现
+  说明书已经被用户在软件里改成了 `简记 · 使用说明.md`（H1 是 `# 简记 · 使用说明`），
+  于是写到新名字下，并把旧名字那两张孤儿 png 清掉了。要是还写死文件名，这次就会在旁边
+  多出一份副本。

@@ -42,19 +42,42 @@ access violation，换台机器 / 换个 Windows 版本还可能对不上。
 中文文稿直接就是中文朗读。换音色要往 `Voice` putref 传一个 `ISpeechObjectToken`，
 而那个 token 的 `GetDescription` 在 `IDispatch` 下取不到（`DISP_E_TYPEMISMATCH`），
 投入产出不划算 —— 真要做，得改走 vtable 直调。
+
+本机 SAPI5 能看见的中文音色**只有一个**（`TTS_MS_ZH-CN_HUIHUI_11.0`），所以音色
+这一侧没有可调空间。（Win10/11 还有一套更自然的 OneCore 音色，注册在
+`HKLM\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices`，SAPI5 **看不见**；要把它们的
+token 搬进 SAPI5 的注册表项才认，那是要管理员权限的一次性改造，没做。）
+
+## 怎么让它别那么机械：SSML
+
+默认的 SAPI 中文朗读听起来像机器赶稿，主要不是音色问题，是**节奏**问题：
+
+- 它几乎**不给空行停顿**。`speakable_text()` 用空行分段，可纯文本送进去，
+  段落之间和句子之间一样是「连着念」。
+- 它对 `。！？` 的停顿**又短又齐**，每句都停一样长，听起来就是机械的。
+
+SAPI5 支持 SSML，`ISpVoice::Speak` 带 `SVSF_IS_XML`（= 8）标志时就把入参当 XML 解析。
+于是 `build_ssml()` 把正文转成带显式 `<break>` 的 SSML：段间长停、句末短停。
+**这是不引入任何新依赖的前提下唯一真正有效的杠杆**——改音色要管理员权限，
+改音频滤镜（EQ、混响）治不了节奏。
+
+语速走 `voice.Rate`（和原来同一个旋钮），**不放进 SSML 的 `<prosody rate>`**：
+两个地方各设一次会叠乘，调起来对不上账。
 """
 
 from __future__ import annotations
 
 import ctypes
 import os
+import re
 import wave
 import winreg
 from ctypes import POINTER, byref, c_void_p
 from pathlib import Path
 
-__all__ = ["SpeechError", "default_voice_name", "is_available", "synthesize",
-           "wav_seconds"]
+__all__ = ["SpeechError", "build_ssml", "default_voice_name", "is_available",
+           "synthesize", "wav_seconds",
+           "NATURAL_RATE", "PARAGRAPH_BREAK_MS", "SENTENCE_BREAK_MS"]
 
 
 class SpeechError(RuntimeError):
@@ -98,6 +121,9 @@ DISPID_PROPERTYPUT = -3
 VT_I4, VT_BSTR, VT_DISPATCH, VT_BOOL = 3, 8, 9, 11
 
 SSFM_CREATE_FOR_WRITE = 3
+
+#: `ISpVoice::Speak` 的标志位：入参按 SSML（XML）解析。见模块开头的「SSML」一节。
+SVSF_IS_XML = 8
 
 
 class _GUID(ctypes.Structure):
@@ -333,12 +359,92 @@ def is_available() -> bool:
         return False
 
 
+# ------------------------------------------------------------- 让它别那么机械
+
+#: 默认语速。0 是 SAPI 的「正常」，可中文听下来偏快、偏赶；**降一档**明显更像
+#: 人说话。范围 -10..10，再慢就要拖长腔了。
+NATURAL_RATE = -1
+
+#: 段间停顿（毫秒）。正文里的空行 = 换段，念到这里停这么久。
+PARAGRAPH_BREAK_MS = 450
+
+#: 句末停顿（毫秒）。SAPI 自己也会停，但停得又短又齐，补一点点就够；
+#: 补多了会把一句话切碎，反而更假。
+SENTENCE_BREAK_MS = 160
+
+#: 段**内**的换行（列表项、多行短句）停顿，比段间短。
+LINE_BREAK_MS = 260
+
+#: 句末标点。**只认强停顿**：逗号顿号不加，SAPI 本来就会在逗号上停一下，
+#: 再插一个 `<break>` 会把句子切得一顿一顿的。
+_SENTENCE_END_RE = re.compile(r"([。！？；…!?;])")
+
+_SSML_ESCAPE = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+_BREAK_TAG_RE = re.compile(r"(?:<break time='\d+ms'/>)+$")
+
+
+def _escape(text: str) -> str:
+    """XML 转义。`&` 必须**第一个**换，否则会把后面换出来的 `&lt;` 再换一遍。"""
+    for raw, escaped in _SSML_ESCAPE:
+        text = text.replace(raw, escaped)
+    return text
+
+
+def _gap(milliseconds: int) -> str:
+    """一个停顿标签。毫秒为 0 时**返回空串**，不留 `<break time='0ms'/>`。
+
+    0ms 的标签对 SAPI 确实是个空操作（实测时长与纯文本一模一样），但它会让
+    「把停顿关掉，跟纯文本对照」这条核验变成假的：字符串里还看得见 `<break`，
+    分不清是没生效还是没关掉。**关就是关，别留半个标签。**
+    """
+    return f"<break time='{milliseconds}ms'/>" if milliseconds > 0 else ""
+
+
+def build_ssml(text: str, *, paragraph_break_ms: int = PARAGRAPH_BREAK_MS,
+               sentence_break_ms: int = SENTENCE_BREAK_MS,
+               line_break_ms: int = LINE_BREAK_MS) -> str:
+    """把正文转成带停顿的 SSML，交给 `synthesize(..., xml=True)`。
+
+    停顿是照着 `speakable_text()` 的输出结构来的（空行分段、段内单换行分行），
+    所以正文里的排版节奏会原样传到耳朵里：
+
+      · 空行（段落之间）→ `paragraph_break_ms`
+      · 段内换行（列表项、一行一句）→ `line_break_ms`
+      · `。！？；…` 之后 → `sentence_break_ms`
+
+    传 `0` 表示**这一处不加停顿**（换回一个普通换行，跟纯文本一样），
+    核验时拿它跟「加了停顿」的版本比时长。
+
+    **标签里的时间是毫秒整数**，SAPI 认这个写法；写成 `0.5s` 之类也认，
+    但整数毫秒不用考虑本地化的小数点。
+    """
+    blocks: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text.strip()):
+        lines = [line.strip() for line in paragraph.split("\n") if line.strip()]
+        if not lines:
+            continue
+        body = (_gap(line_break_ms) or "\n").join(_escape(line) for line in lines)
+        if sentence_break_ms:
+            body = _SENTENCE_END_RE.sub(
+                lambda match: f"{match.group(1)}{_gap(sentence_break_ms)}", body)
+            # 句号正好在段尾时，那个 `<break>` 会和段间停顿叠一起 → 去掉
+            body = _BREAK_TAG_RE.sub("", body)
+        blocks.append(body)
+    return ("<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' "
+            "xml:lang='zh-CN'>"
+            + (_gap(paragraph_break_ms) or "\n").join(blocks) + "</speak>")
+
+
 def synthesize(text: str, path: Path, *, rate: int = 0, volume: int = 100,
-               timeout_ms: int | None = None) -> int:
+               timeout_ms: int | None = None, xml: bool = False) -> int:
     """把 `text` 合成到 `path`（WAV），返回写出的字节数。
 
     `rate` 是语速（-10..10，0 为正常），`volume` 是音量（0..100）。
     音色用系统默认（本机是中文音色，见模块开头的「音色」一节）。
+
+    `xml=True` 时 `text` 按 **SSML** 解析（`build_ssml()` 产出的那种），
+    可以带 `<break>`、`<prosody>` 这些标签。**默认的 `False` 走纯文本**——
+    正文里正好出现一个 `<` 时不会被当成标签吞掉。
 
     **会阻塞**，直到整篇念完。合成比排版慢得多（语速按每秒 5 个汉字估），
     长文可能要好几分钟，调用方必须放到后台线程里跑，别卡住界面。
@@ -369,7 +475,8 @@ def synthesize(text: str, path: Path, *, rate: int = 0, volume: int = 100,
 
             text_variant, text_handle = _variant_bstr(text)
             handles.append(text_handle)
-            _invoke(voice, "Speak", [text_variant, _variant_i4(0)])
+            _invoke(voice, "Speak",
+                    [text_variant, _variant_i4(SVSF_IS_XML if xml else 0)])
             _invoke(voice, "WaitUntilDone", [_variant_i4(timeout_ms)])
             _invoke(stream, "Close", [])
         finally:
@@ -404,6 +511,12 @@ if __name__ == "__main__":                   # pragma: no cover - 手工核验�
 
     print("可用:", is_available())
     print("默认音色:", default_voice_name())
+    sample = "简记，把文字变成声音。这是第二句话，确认多句也连着念。\n\n换了一段，停顿应该长一点。"
     out = Path(tempfile.gettempdir()) / "jianji_speech_demo.wav"
-    size = synthesize("简记，把文字变成声音。这是第二句话，确认多句也连着念。", out)
-    print(f"写出 {out}  {size} 字节")
+    size = synthesize(sample, out, rate=NATURAL_RATE, xml=False)
+    print(f"纯文本：{out}  {size} 字节  {wav_seconds(out):.1f} 秒")
+    out2 = Path(tempfile.gettempdir()) / "jianji_speech_demo_ssml.wav"
+    size2 = synthesize(build_ssml(sample), out2, rate=NATURAL_RATE, xml=True)
+    print(f"带停顿：{out2}  {size2} 字节  {wav_seconds(out2):.1f} 秒")
+    print(f"（差 {wav_seconds(out2) - wav_seconds(out):+.1f} 秒，应当 ≈ "
+          f"{(PARAGRAPH_BREAK_MS + 2 * SENTENCE_BREAK_MS) / 1000:.1f} 秒）")
