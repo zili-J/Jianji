@@ -16,6 +16,14 @@
   `* text=auto eol=lf` 会连入口文件一起转成 LF，cmd.exe 对 LF 批处理容忍度有限
   （`goto :label` 会失效）。**改属性后要手动把工作区文件转回 CRLF**——git 只在检出时改写。
   判据 `git ls-files --eol <file>` = `i/lf  w/crlf  attr/text eol=crlf`。
+- **备份已通**（2026-09-28）：远端 `refs/heads/main` = 本地 `main` = `71cf719`，73 个文件，
+  上游 `origin/main` 已设。以后推只要 `git push`（凭据已在 Windows 凭据管理器里）。
+- **`cmdkey /list` 查不到 github 条目 ≠ 没有凭据**：GCM 照样能取到。
+  判断有没有凭据要直接跑 `printf "protocol=https\nhost=github.com\n\n" | git credential-manager get`。
+- **Git Bash 会把 `ref:path` 参数改坏**：`git cat-file -e "origin/main:.gitattributes"` 会报
+  `Not a valid object name origin\main;.gitattributes`（`:`→`;`、`/`→`\`，MSYS 路径转换），
+  而且**时灵时不灵**，能骗出「文件缺失」的假结论。改用 `git ls-tree origin/main <path>`
+  或加 `MSYS_NO_PATHCONV=1`。**报缺失前先用另一种写法复核**。
 
 ## 交付物 / 运行 / 测试
 
