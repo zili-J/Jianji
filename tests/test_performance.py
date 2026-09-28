@@ -345,24 +345,34 @@ class PerformanceTests(unittest.TestCase):
     def test_visible_lines_walk_logical_lines_only(self) -> None:
         """可见行只该按**逻辑行**问 Tk，不能按显示行逐条推算。
 
-        旧实现用 index("N.0 + 1 display lines") 一条条挪显示行，
-        一次重画要跑几十次，是滚动时最贵的一步。
+        旧实现用 index("N.0 + 1 display lines") 一条条挪显示行，一次重画要跑几十次，
+        是滚动时最贵的一步——实测它 200–436 µs 一次，而 dlineinfo 只要 4 µs。
+
+        这一条守两件事：
+        ① 只有引用和表格需要展开续行，别的行不该按显示行推算；
+        ② **不折的行一次都不该问**：先花两次便宜的 `dlineinfo` 判「折没折」再返回。
+           夹具里引用/表格那几行全都不折，旧实现白白问了 5 次 ≈ 1.6 ms，
+           占一次滚动重画的三分之一（实测 `_redraw_margins` 4.8 ms → 1.8 ms）。
         """
         warm = self.app._visible_lines()
         logical = {number for number, _offset, _info in warm}
-        wrapped = {number for number in logical
-                   if self.app._block_of(number).kind in ("quote", "table")}
+        expandable = {number for number in logical
+                      if self.app._block_of(number).kind in ("quote", "table")}
+        self.assertTrue(expandable, "夹具里应当有引用/表格行，否则这条用例守不住东西")
 
         with spy_method(self.app.editor, "dlineinfo") as dline, \
                 spy_method(self.app.editor, "index") as index:
             self.app._visible_lines()
 
-        self.assertLessEqual(len(dline), len(logical) + 2,
-                             "每个可见的逻辑行最多问一次 dlineinfo")
-        display_queries = [args for args in index if "display lines" in str(args[0])]
+        # 每个逻辑行一次；引用/表格再多两次（判折行用的，很便宜）
         self.assertLessEqual(
-            len(display_queries), len(wrapped) + 2,
-            "只有引用和表格需要展开续行，别的行不该按显示行推算",
+            len(dline), len(logical) + 2 * len(expandable) + 2,
+            "每个逻辑行最多一次 dlineinfo，引用/表格再多两次判折行",
+        )
+        display_queries = [args for args in index if "display lines" in str(args[0])]
+        self.assertEqual(
+            display_queries, [],
+            "夹具里的引用/表格都不折行，一次 display lines 推算都不该有",
         )
 
     def test_visible_lines_are_cheap(self) -> None:

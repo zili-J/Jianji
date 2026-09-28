@@ -239,6 +239,10 @@ TOP_BAR_HEIGHT = 46
 # 用户要求 25%。写长文时最后一行贴着窗口下沿很难受，光标停在末尾时连「下一行」
 # 都看不见。用最后一行上的 `spacing3` 标签实现——它是**显示层**的空白，不进正文、
 # 不进存盘、也不影响导出（导出读的是纯文本，自己另排一套版）。
+# **留白必须挂在「末尾那个空行」上**，不能挂在有正文的那一行上：Tk 画选中高亮
+# 时把整个显示行盒子（含 `spacing3`）一起涂色，挂在正文行上就会出现
+# 「选中最后一行 → 一大块蓝盖住留白」。所以正文末尾要保证有一个空行，
+# 见 `_ensure_trailing_newline`。
 EDITOR_BOTTOM_PAD_RATIO = 0.25
 
 # 标题徽标：各级标题字号与正文一致后，靠左侧的 H1/H2/H3 标记区分层级
@@ -459,7 +463,7 @@ LIST_WHEEL_UNITS = 3
 
 # 导出长图的尺寸（EXPORT_WIDTH / EXPORT_MARGIN / EXPORT_BODY_SIZE /
 # EXPORT_MAX_HEIGHT）定义在 image_export 里，这里直接引用，避免两处各写一份：
-# 宽度按手机屏宽定死，字号按「手机上一行约 29 个汉字」定，长度由内容决定，
+# 宽度按手机屏宽定死，字号按「手机上一行正好 20 个汉字」定，长度由内容决定，
 # 只有超长的文档才分张。
 
 HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*)$")
@@ -1935,6 +1939,14 @@ class JianJiApp:
         「留白值变了」或「标签现在没盖住最后一行」（判据本身见
         `_bottom_pad_covers_last_line`）；`open_file` 换整篇正文时标签会被清空，
         那里必须 `force=True`。
+
+        **留白要挂在「末尾那个空行」上才躲得开选中高亮**（理由见
+        `_ensure_trailing_newline`）。正文进编辑器时已经保证末尾有换行，所以正常
+        情况下挂的就是空行。残留一种情形：用户把末尾那个换行删掉（Backspace 并到
+        上一行、整段删掉末尾、粘贴替换），标签会退回正文行上，选中高亮重新盖住留白
+        ——这里**故意不去补那个换行**。补了就变成「末尾空行删不掉」，Backspace 在
+        那里静默失效，比这个只在选中时才出现的观感问题更烦人；重新打开文稿就会
+        自动恢复。
         """
         height = self.editor.winfo_height()
         if height <= 1:
@@ -2247,8 +2259,25 @@ class JianJiApp:
         return result
 
     def _continuation_lines(self, number: int) -> list[tuple[int, int, tuple]]:
-        """某一逻辑行自动换行出来的续行（不含第一显示行）。"""
+        """某一逻辑行自动换行出来的续行（不含第一显示行）。
+
+        **先花两次便宜的 `dlineinfo` 问「这一行到底折没折」，折了才去走
+        `+ 1 display lines`**：后者是 Tk 里最贵的下标运算之一（实测
+        200–436 µs 一次，而 `dlineinfo` 只要 4 µs、`@0,y` 只要 19 µs）。
+        引用和表格在视口里各占好几行，可绝大多数行根本不折——实测一次滚动重画里
+        7 次 `+ 1 display lines` 有 6 次是白问，合起来 1.6 ms，占整帧三分之一
+        （`_visible_lines` 的注释里已经写明这个运算最贵，主循环躲开了，
+        这里当时漏了）。
+        """
         out: list[tuple[int, int, tuple]] = []
+        first = self._display_line_box(f"{number}.0")
+        if first is None:
+            return out
+        # 末尾量不到（末行折到视口外面去了）时**不能**当成「没折」，退回下面那条
+        # 精确但昂贵的路——那种情况下前半截续行是可见的，竖条/表格框还得画。
+        tail = self._display_line_box(f"{number}.end")
+        if tail is not None and tail[1] == first[1]:
+            return out          # 首尾落在同一显示行上 = 这一行没折
         try:
             index = self.editor.index(f"{number}.0 + 1 display lines")
         except tk.TclError:
@@ -3485,6 +3514,40 @@ class JianJiApp:
         self.refresh_files()
         self.status_label.configure(text=f"已移到回收站：{entry.original_relative}")
 
+    def _ensure_trailing_newline(self, text: str) -> str:
+        """正文进编辑器之前，末尾若没有换行符就补一个，返回补好的正文。
+
+        **为什么非要末尾那一行是空行**：底部留白是给最后一行挂的 `spacing3`，
+        而 Tk 画选中高亮（和标签背景）时把**整个显示行盒子**（含 `spacing3`）
+        一起涂色。只有让末尾多出一个空行、留白挂在那个空行上，选中上面那行正文
+        才画不到留白。实测（用户设置，视口 1071px、留白 267px）：
+
+          末尾无换行 → 留白标签落在正文行上 → 阴影高 310px = 留白 267 + 行自身高
+          末尾有换行 → 留白标签落在空行上   → 阴影高  51px = 只剩行自身高（干净）
+
+        **关键是两者相差 ≈ 留白值**（310 − 51 = 259 ≈ 267）：留白有多大，阴影就多出多大。
+        绝对像素会随文稿和设置浮动（`tools/_probe_pad_tag_range.py` 量过几种结尾），
+        别把 310/51 当成常量。
+
+        用户看到的正是第一种：「选中最后一行的文字后，阴影会覆盖下面留白」。
+        实测用户文稿里 21 份有 5 份末尾没有换行（含一份 4.8KB 的日记）。
+
+        **标签怎么摆都躲不开**（逐种摆法都实测过）：空区间 `end..end` 会被 Tk
+        直接丢掉（`tag_ranges` 为空、留白整段失效）；`end-1c..end` 只盖住换行符，
+        留白同样失效；`end-1c linestart..end-1c lineend` 与 `..end` 都盖住留白。
+        标签的 `background` 也一样盖住留白，所以「自己画选中高亮」这条路也堵死。
+
+        **补在字符串上而不是插进控件里**：插一下会再发一次 `<<Modified>>`，
+        等于打开一份文稿多跑一遍重解析；拼进 `insert` 的入参就只有一次事件。
+        空文稿不补（没有正文行，留白本来就在空行上）。
+
+        副作用：这类文稿存盘后末尾会多一个换行符（`save_now` 写的就是控件里的正文）。
+        用户已确认接受——几乎所有编辑器都这么干。
+        """
+        if text and not text.endswith("\n"):
+            return text + "\n"
+        return text
+
     def _load_editor_text(self, text: str, cursor: str | None = None) -> None:
         """把整篇正文换进编辑器，并把撤销栈与脏标志一并重置。
 
@@ -3495,10 +3558,14 @@ class JianJiApp:
         三处调用（打开文档、打开回收站条目、主题重建）原来各抄一遍，现在改这里
         就是改全部。只读场景（回收站）由调用方在这之后自己 `configure(state="disabled")`
         ——本函数一律把编辑器留在可写状态，因为调用方紧接着还要改正文之外的东西。
+
+        末尾补的那个换行必须补在 `edit_reset()` **之前**：这样它不进撤销栈
+        （否则 Ctrl+Z 会先把留白用的空行撤掉），也不算「用户改动」，
+        打开文稿时不会立刻变脏、也就不会平白触发一次存盘。
         """
         self.editor.configure(state="normal")
         self.editor.delete("1.0", "end")
-        self.editor.insert("1.0", text)
+        self.editor.insert("1.0", self._ensure_trailing_newline(text))
         if cursor is not None:
             self.editor.mark_set("insert", cursor)
         self.editor.edit_reset()

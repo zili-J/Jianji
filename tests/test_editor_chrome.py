@@ -315,6 +315,78 @@ class EditorBottomPadTests(unittest.TestCase):
         self.root.update()
         self.assertEqual(editor.get("1.0", "end-1c"), before)
 
+    # ---------- 末尾那个空行（留白挂得住的唯一位置） ----------
+
+    def test_a_document_without_a_trailing_newline_gets_one(self) -> None:
+        """末尾没有换行的文稿，进编辑器时补一个——留白只有挂在空行上才躲得开高亮。
+
+        用户报的：「选中最后一行的文字后，阴影会覆盖下面留白」。根因是留白挂在
+        **正文行**上时，Tk 把整个显示行盒子（含 `spacing3`）一起涂成选中色。
+        实测（用户设置，视口 1071px、留白 267px）：末尾无换行 → 阴影高 310px；
+        末尾有换行 → 51px。**两者相差 ≈ 留白值**（310 − 51 = 259 ≈ 267）——
+        留白有多大，阴影就多出多大；绝对值会随文稿和设置浮动，别当常量。
+        用户文稿里 21 份有 5 份末尾没有换行。
+        """
+        plain = self.tmp / "简记日记" / "没有末尾换行.md"
+        plain.write_bytes("# 标题\n\n正文最后一句。".encode("utf-8"))
+        self.app.open_file(plain)
+        self.root.update()
+
+        editor = self.app.editor
+        self.assertTrue(editor.get("1.0", "end-1c").endswith("\n"),
+                        "末尾应当补上一个换行")
+        self.assertFalse(self.app.dirty, "补这个换行不算用户改动，不该让文稿变脏")
+
+        ranges = editor.tag_ranges("bottom_pad")
+        self.assertEqual(len(ranges), 2, "留白标签应当只有一段")
+        self.assertEqual(editor.index(ranges[0]), editor.index("end-1c linestart"),
+                         "留白标签没有挂在末尾那个空行上")
+
+        # 最直接的判据：正文末行的显示行盒子**不能**含留白——含了就会被涂成选中色
+        editor.yview_moveto(1.0)
+        self.root.update()
+        last_content = int(editor.index("end-1c").split(".")[0])
+        while last_content > 1 and not editor.get(f"{last_content}.0",
+                                                  f"{last_content}.end"):
+            last_content -= 1
+        box = editor.dlineinfo(f"{last_content}.0")
+        self.assertIsNotNone(box, "滚到底时正文末行应当可见")
+        self.assertLess(box[3], self.app._bottom_pad,
+                        f"正文末行的行盒 {box[3]}px 把留白 {self.app._bottom_pad}px 也算进去了")
+
+    def test_a_document_that_already_ends_with_a_newline_is_untouched(self) -> None:
+        """已经有末尾换行的文稿不许被补成两个空行。
+
+        这里一律用 `write_bytes` 写文稿：Windows 上 `write_text` 会把 `\\n` 翻成
+        `\\r\\n`，而 Tk 的 `Text` 只拿 `\\n` 分行、行尾那个 `\\r` 算**行内容**，
+        断言正文时会莫名其妙地不相等。
+        """
+        doc = self.tmp / "简记日记" / "有末尾换行.md"
+        doc.write_bytes("# 标题\n\n正文最后一句。\n".encode("utf-8"))
+        self.app.open_file(doc)
+        self.root.update()
+        self.assertEqual(self.app.editor.get("1.0", "end-1c"),
+                         "# 标题\n\n正文最后一句。\n")
+
+    def test_an_empty_document_is_left_empty(self) -> None:
+        """空文稿不补——它没有正文行，留白本来就挂在空行上。"""
+        blank = self.tmp / "简记日记" / "空文稿.md"
+        blank.write_bytes(b"")
+        self.app.open_file(blank)
+        self.root.update()
+        self.assertEqual(self.app.editor.get("1.0", "end-1c"), "")
+
+    def test_the_saved_file_keeps_a_trailing_newline(self) -> None:
+        """补进来的换行要跟着存盘——「文稿末尾自动补空行」落到文件上才算数。"""
+        plain = self.tmp / "简记日记" / "存盘看末尾.md"
+        plain.write_bytes("正文最后一句。".encode("utf-8"))
+        self.app.open_file(plain)
+        self.root.update()
+        self.app.dirty = True
+        self.assertTrue(self.app.save_now())
+        self.assertTrue(plain.read_bytes().endswith(b"\n"),
+                        "存盘后文件末尾应当有换行符")
+
     def test_the_pad_tag_stays_on_one_line(self) -> None:
         """留白标签必须只落在**一行**上。
 
