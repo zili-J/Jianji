@@ -277,9 +277,10 @@ def list_markdown(folder: Path, recursive: bool = False,
 def list_subfolders(root: Path, recursive: bool = False) -> list[Path]:
     """列出 root 下的文件夹。
 
-    **默认只看一层**：界面上文件夹与「全部文稿」并列，只有一级，不再往下嵌套
-    （用户要求「当前文件夹层级提供一级」「不可在文件夹下新建文件夹」）。
-    要递归列举（老测试、统计用途）显式传 `recursive=True`。
+    **默认只看一层**（只要直接子目录）。界面上的文件夹树是**多层**的，走的是
+    `recursive=True`；默认这个「一层」留给「只要一层」的调用方，别改默认值。
+
+    两种模式都跳过隐藏目录（`.简记回收站` 之类）。
     """
     if not root.is_dir():
         return []

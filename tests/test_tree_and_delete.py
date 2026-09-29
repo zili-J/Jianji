@@ -63,10 +63,11 @@ class TreeListingTests(unittest.TestCase):
             self.assertNotIn("secret.md", names)
 
     def test_subfolder_listing_is_one_level_by_default(self) -> None:
-        """默认只列一层：文件夹与「全部文稿」并列，不再往下嵌套（用户要求）。
+        """`list_subfolders` 不传参时只列直接子目录。
 
-        `工作/2026` 这种二级文件夹不该出现在列表里——它仍然存在于磁盘上，
-        里面的文稿也照样能在「全部文稿」里找到，只是不作为一个树节点出现。
+        界面上的文件夹树是**多层**的，走的是 `recursive=True`；这里钉的是函数
+        自己的默认值——别因为「界面要多层」就顺手把默认改成递归，
+        那会让所有「只要一层」的调用方跟着变。
         """
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -120,7 +121,11 @@ class DeleteSafetyTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_DISPLAY, "需要图形界面环境")
 class FolderTreeShapeTests(unittest.TestCase):
-    """文件夹树只有一级，与「全部文稿」并列；不能在文件夹下再建文件夹（用户要求）。"""
+    """文件夹树**多层嵌套**：顶层与「全部文稿」并列，子文件夹挂在各自父节点下。
+
+    （原来是「只有一级、且不可在文件夹下新建文件夹」，用户后来要求「多层文件夹预览」，
+    那条限制随之放开——见 `test_a_subfolder_can_be_created_inside_a_folder`。）
+    """
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -164,28 +169,77 @@ class FolderTreeShapeTests(unittest.TestCase):
                           for iid in self.app.folder_tree.get_children("__all__")],
                          "文件夹不该挂在「全部文稿」下面")
 
-    def test_second_level_folder_is_not_a_tree_node(self) -> None:
-        """`工作/2026` 不再作为节点出现——层级只保留一级。"""
+    def test_second_level_folder_is_a_tree_node_under_its_parent(self) -> None:
+        """`工作/2026` 现在**是**一个节点，且挂在 `工作` 下面（多层文件夹预览）。"""
         all_iids = self._walk_iids()
         labels = [self.app.folder_tree.item(iid, "text") for iid in all_iids]
-        self.assertNotIn("2026", labels)
-        self.assertNotIn(str(self.folder / "工作" / "2026"), all_iids)
+        self.assertIn("2026", labels, "二级文件夹应当作为节点出现")
+        deep_iid = str(self.folder / "工作" / "2026")
+        self.assertIn(deep_iid, all_iids)
+        self.assertEqual(
+            self.app.folder_tree.parent(deep_iid),
+            str(self.folder / "工作"),
+            "二级文件夹要挂在它的父文件夹下，而不是跟顶层文件夹并排",
+        )
+
+    def test_the_parent_folder_is_still_top_level(self) -> None:
+        """加了嵌套之后，顶层文件夹**仍然**与「全部文稿」并列（不挂进它下面）。"""
+        self.assertEqual(
+            self.app.folder_tree.parent(str(self.folder / "工作")), "",
+        )
 
     def test_deep_documents_are_still_listed_under_all_documents(self) -> None:
-        """二级文件夹里的文稿照样能在「全部文稿」里找到（只是不作为节点显示）。"""
+        """二级文件夹里的文稿照样能在「全部文稿」里找到。"""
         self.app.show_all()
         self.root.update()
         names = {path.name for path in self.app.file_paths}
         self.assertIn("计划.md", names, "二级文件夹里的文稿也应在全部文稿里")
 
-    def test_no_new_subfolder_entry_on_a_folder(self) -> None:
-        """文件夹的右键菜单里不该有「新建子文件夹」（从入口上杜绝嵌套）。"""
+    def test_clicking_a_folder_shows_only_its_own_documents(self) -> None:
+        """点「工作」只显示直接放在它里面的，`工作/2026` 里的不混进来。"""
+        self.app._apply_tree_selection(str(self.folder / "工作"))
+        self.app.refresh_files()
+        self.root.update()
+        names = {path.name for path in self.app.file_paths}
+        self.assertEqual(names, {"会议.md"})
+
+    def test_a_deep_folder_can_be_scoped_too(self) -> None:
+        """二级文件夹也点得进去。"""
+        self.app._apply_tree_selection(str(self.folder / "工作" / "2026"))
+        self.app.refresh_files()
+        self.root.update()
+        self.assertEqual({path.name for path in self.app.file_paths}, {"计划.md"})
+
+    def test_collapse_state_survives_a_tree_rebuild(self) -> None:
+        """收起来的文件夹在重建之后还是收着的。
+
+        没有这条的话，`_rebuild_tree` 每次都无条件展开，「收起」等于白点。
+        """
+        work_iid = str(self.folder / "工作")
+        self.app.folder_tree.item(work_iid, open=False)
+        self.app._rebuild_tree()
+        self.root.update()
+        self.assertFalse(self.app.folder_tree.item(work_iid, "open"),
+                         "用户收起来的文件夹不该自己张开")
+
+    def test_a_subfolder_can_be_created_inside_a_folder(self) -> None:
+        """文件夹的右键菜单里有「新建子文件夹…」，并且真的建在它里面。"""
         menu = self.app._tree_menu(str(self.folder / "工作"))
         labels = [menu.entrycget(index, "label")
                   for index in range(menu.index("end") + 1)
                   if menu.type(index) != "separator"]
-        self.assertNotIn("新建子文件夹…", labels)
-        self.assertNotIn("新建文件夹…", labels)
+        self.assertIn("新建子文件夹…", labels)
+        self.assertNotIn("新建文件夹…", labels, "文件夹上给的是「子文件夹」那一条")
+
+        self.app._ask_folder_name = lambda *_args, **_kwargs: "周报"
+        self.app.new_folder(self.folder / "工作")
+        self.root.update()
+        self.assertTrue((self.folder / "工作" / "周报").is_dir())
+        # 挂在「工作」下面，不是并排
+        self.assertEqual(
+            self.app.folder_tree.parent(str(self.folder / "工作" / "周报")),
+            str(self.folder / "工作"),
+        )
 
     def test_new_folder_entry_is_offered_on_all_documents(self) -> None:
         menu = self.app._tree_menu("__all__")
@@ -195,7 +249,7 @@ class FolderTreeShapeTests(unittest.TestCase):
         self.assertIn("新建文件夹…", labels)
 
     def test_new_folder_is_created_at_the_top_level(self) -> None:
-        """从入口新建的文件夹一律落在日记文件夹根下。"""
+        """从「全部文稿」的入口新建的文件夹一律落在日记文件夹根下。"""
         self.app._ask_folder_name = lambda *_args, **_kwargs: "随笔"
         self.app.new_folder()
         self.root.update()

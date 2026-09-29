@@ -148,12 +148,12 @@ class MoveDocumentUiTests(unittest.TestCase):
         self.assertIn("移动到", self._labels(menu))
         self.assertIn("删除文档（移到回收站）", self._labels(menu))
 
-    def test_move_submenu_lists_top_level_folders(self) -> None:
-        """子文件夹里的文档：能回根目录、能去别的顶层文件夹，就是没有自己这一层。
+    def test_move_submenu_lists_folders_of_every_level(self) -> None:
+        """子文件夹里的文档：能回根目录、能去别的文件夹，**包括嵌套的**。
 
-        文件夹层级只有一级（用户要求「当前文件夹层级提供一级」），所以 `读书/随笔`
-        这种嵌套目录**不再出现**：界面上根本看不到它，菜单里却列出来，
-        只会让人以为文档挪到哪儿去了。
+        文件夹树是多层的（用户要求「多层文件夹预览」），所以 `读书/随笔` 这种
+        嵌套目录也要出现在菜单里，显示成相对路径——树上看得到的东西，
+        菜单里才列得出来。
         """
         (self.folder / "工作").mkdir()
         inside = self.folder / "读书" / "在里面.md"
@@ -163,26 +163,26 @@ class MoveDocumentUiTests(unittest.TestCase):
 
         self.assertIn("全部文稿（根目录）", labels)
         self.assertIn("工作", labels, "别的顶层文件夹可以移进去")
+        self.assertIn("读书/随笔", labels, "嵌套文件夹也要能移进去")
         self.assertNotIn("读书", labels, "当前所在文件夹不该出现在菜单里")
-        self.assertNotIn("读书/随笔", labels, "嵌套目录不再出现在菜单里")
         self.assertIn("新建文件夹并移动…", labels)
 
     def test_move_submenu_for_root_document_only_lists_subfolders(self) -> None:
-        """根目录里的文档：不再列根目录（移过去等于没动），只列顶层子文件夹。"""
+        """根目录里的文档：不再列根目录（移过去等于没动），子文件夹都在。"""
         labels = self._labels(self._submenu(self.app._doc_menu(self.doc), "移动到"))
         self.assertEqual(
             [label for label in labels if label != "新建文件夹并移动…"],
-            ["读书"],
+            ["读书", "读书/随笔"],
         )
 
-    def test_move_targets_are_one_level_only(self) -> None:
-        """移动目标和文件夹树一样只有一级——两边不一致比少一个选项更让人困惑。"""
+    def test_move_targets_cover_every_level(self) -> None:
+        """移动目标列出全部层级，显示成相对路径——和文件夹树的口径一致。"""
         self.assertEqual(
             [label for label, _path in self.app._move_targets(self.doc)],
-            ["读书"],
+            ["读书", "读书/随笔"],
         )
 
-    def test_move_submenu_skips_the_current_folder(self) -> None:
+    def test_move_targets_skip_the_current_folder(self) -> None:
         targets = dict(self.app._move_targets(self.doc))
         self.assertNotIn("读书", [label for label in targets if targets[label] == self.folder])
         # 文档在根目录：不再列根目录，但子文件夹都在
@@ -194,7 +194,7 @@ class MoveDocumentUiTests(unittest.TestCase):
         labels = [label for label, _path in self.app._move_targets(inside)]
         self.assertNotIn("读书", labels, "当前所在文件夹不该出现")
         self.assertIn("全部文稿（根目录）", labels)
-        self.assertNotIn("读书/随笔", labels, "嵌套目录不参与")
+        self.assertIn("读书/随笔", labels, "子文件夹是另一层，能移进去")
 
     def test_targets_never_include_the_trash(self) -> None:
         self.app.delete_document(self.folder / "第二篇.md")
@@ -297,6 +297,25 @@ class MoveDocumentUiTests(unittest.TestCase):
         self.assertTrue(moved.exists())
         self.assertFalse(self.doc.exists())
         self.assertIn(self.folder / "九月", self.app._tree_nodes, "新文件夹要进文件夹树")
+
+    def test_new_folder_and_move_nests_beside_the_document(self) -> None:
+        """文档已经在子文件夹里时，新文件夹建在**它那一层**，不是一律建到根上。
+
+        建到根上的话，「就近归档」会变成把文档往上搬一层。
+        """
+        import main
+
+        inside = self.folder / "读书" / "在里面.md"
+        inside.write_text("# 在里面\n\n正文。\n", encoding="utf-8")
+        original = main.simpledialog.askstring
+        main.simpledialog.askstring = lambda *a, **k: "九月"
+        try:
+            self.app.new_folder_and_move(inside)
+        finally:
+            main.simpledialog.askstring = original
+        self.root.update()
+        self.assertTrue((self.folder / "读书" / "九月" / "在里面.md").exists())
+        self.assertFalse((self.folder / "九月").exists(), "不该跑到根上去")
 
     def test_new_folder_and_move_cancel_changes_nothing(self) -> None:
         import main

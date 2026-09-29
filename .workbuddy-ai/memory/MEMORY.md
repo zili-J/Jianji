@@ -1,7 +1,11 @@
 # 简记 · 项目长期笔记
 
 > 只留「不照做就会犯错」的约定与落点。细节见 `memory/YYYY-MM-DD.md`、`.3things/build-log.md`、
-> 技能 `tk-text-incremental-highlight`（Tk 硬约束全清单）、`long-image-export`、`quiet-desktop-gui-run`。
+> 技能 `tk-text-incremental-highlight`（Tk 硬约束全清单）、`long-image-export`、
+> `windows-gui-quiet-capture`（隐藏桌面跑 GUI + 截图）。
+> **`quiet-desktop-gui-run` 与 `windows-gui-screenshot` 已合并进 `windows-gui-quiet-capture`**（2026-09-29），
+> 那两个名字不再存在，别再去找；Tk 控件内部的坑（`dlineinfo`/`bbox`/elide/`wrap`）统一在
+> `tk-text-incremental-highlight/references/tk-text-traps.md`。
 
 ## 备份 / 远端
 
@@ -191,7 +195,14 @@
 - **文稿排序**：`sort_key`（`name`/`created`/`modified`），`list_markdown(..., sort_key=)` 按时间戳**倒序**；
   `_sort_key_of` 文件刚移走/删掉时退到 `0.0`。**Windows 上 `st_ctime` 就是创建时间**。入口在**文稿列表右键菜单**
   （`_add_sort_cascade`；点卡片下方空白也能弹）。**不要再放回标题栏**（grid 一列宽 = 该列最宽的行，卡片区会少一块）。
-- **文件夹树只有一级**（子文件夹与「全部文稿」并列，`_tree_menu` 只在 `__all__` 给「新建文件夹…」）；
+- **文件夹树是「多层嵌套」的**（2026-09-29 用户要求「多层文件夹预览」，**推翻了原来的「只有一级」**，
+  别再按「一级」去改回来）：顶层文件夹挂**树根**（与「全部文稿」并列），子文件夹挂父节点下；
+  文件夹节点给「新建子文件夹…」，「全部文稿」给「新建文件夹…」。
+  **`_tree_nodes` 不能当父节点查找表用**——它把 `self.folder` 映射到 `"__all__"`（选中同步用），
+  拿来查父节点会把顶层文件夹挂进「全部文稿」**里面**。父节点查找用局部 `folder_iids`。
+  排序键 `(层级, 路径)`，保证父节点先插入。`_open_iids()` 在重建前记展开状态，**删了「收起」就白点**。
+  「全部文稿」递归列全部；点某个文件夹**只显示它自己那一层**（用户明确选的，不是递归）。
+  `_move_targets` 列全部层级、嵌套显示成相对路径。
   已取消「今天」入口与 `Ctrl+D`。
 - **有序列表回车自动续号**（`_on_editor_return`）：沿用缩进与分隔符数字 +1；**空项回车结束列表**；
   **光标不在行尾或有选区时不管**。程序化 `insert` 后要手动 `see("insert")`。

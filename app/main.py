@@ -3137,15 +3137,15 @@ class JianJiApp:
 
         跳过文档当前所在的文件夹（移过去等于没动），根目录显示成「全部文稿」。
 
-        只列**一层**（`list_subfolders` 的默认），和文件夹树保持一致：树上只有一级，
-        菜单里却冒出 `读书/随笔` 这种路径，用户会以为文档挪到自己看不见的地方去了。
+        列出**全部层级**的文件夹（含嵌套），显示成相对路径（`读书/随笔`）——
+        文件夹树现在也是多层的，两边口径一致；界面上看得见的东西，菜单里才列得出来。
         """
         if self.folder is None:
             return []
         choices: list[tuple[str, Path]] = []
         if path.parent != self.folder:
             choices.append(("全部文稿（根目录）", self.folder))
-        for sub in list_subfolders(self.folder):
+        for sub in list_subfolders(self.folder, recursive=True):
             if sub == path.parent:
                 continue
             choices.append((sub.relative_to(self.folder).as_posix(), sub))
@@ -3601,6 +3601,9 @@ class JianJiApp:
 
     def _rebuild_tree(self) -> None:
         tree = self.folder_tree
+        # 重建前先记下每个节点的展开状态。有了嵌套之后「收起」才有意义——
+        # 每次重建都无条件展开的话，用户刚收起来的文件夹下一次刷新又自己张开了。
+        previously_open = self._open_iids()
         self._tree_updating = True
         try:
             tree.delete(*tree.get_children())
@@ -3610,12 +3613,30 @@ class JianJiApp:
             tree.insert("", "end", iid="__all__", text="全部文稿", open=True)
             self._tree_nodes[None] = "__all__"
             self._tree_nodes[self.folder] = "__all__"
-            # 文件夹**只有一级**，而且与「全部文稿」**并列**（用户要求）：
-            # 都挂在根上，不是挂在「全部文稿」下面。之前是递归列举 + 按 parent
-            # 找父节点，于是文件夹会层层嵌套，「全部文稿」看着像个容器。
-            for sub in list_subfolders(self.folder):
+            # 文件夹**多层嵌套**（用户要求「多层文件夹预览」）：顶层文件夹与
+            # 「全部文稿」**并列**（挂在树根上，不是挂进「全部文稿」里面），
+            # 子文件夹挂在各自的父节点下。
+            # 按「层级 + 路径」排序，保证父节点一定先被插进去，子节点才找得到挂点。
+            subfolders = sorted(
+                list_subfolders(self.folder, recursive=True),
+                key=lambda item: (len(item.relative_to(self.folder).parts),
+                                  str(item).lower()),
+            )
+            # 单独一张「文件夹 → 节点」表。**不能拿 `_tree_nodes` 来查父节点**：
+            # 那张表把 `self.folder` 映射到 `"__all__"`（为了选中同步），
+            # 于是顶层文件夹会被挂到「全部文稿」**里面**去，而不是与它并列。
+            folder_iids: dict[Path, str] = {}
+            for sub in subfolders:
+                if sub.parent == self.folder:
+                    parent_iid = ""          # 树根 = 与「全部文稿」并列
+                else:
+                    parent_iid = folder_iids.get(sub.parent)
+                    if parent_iid is None:
+                        continue             # 父目录没进树（隐藏目录之类），跳过
                 iid = str(sub)
-                tree.insert("", "end", iid=iid, text=sub.name, open=True)
+                tree.insert(parent_iid, "end", iid=iid, text=sub.name,
+                            open=previously_open.get(iid, True))
+                folder_iids[sub] = iid
                 self._tree_nodes[sub] = iid
             trash_count = len(list_trash(self.folder))
             trash_label = f"回收站（{trash_count}）" if trash_count else "回收站"
@@ -3623,6 +3644,19 @@ class JianJiApp:
         finally:
             self._tree_updating = False
         self._sync_tree_selection()
+
+    def _open_iids(self) -> dict[str, bool]:
+        """树上每个节点的展开状态。重建前记一份，用来把用户收起来的那些原样收回去。"""
+        tree = self.folder_tree
+        found: dict[str, bool] = {}
+
+        def visit(parent: str) -> None:
+            for iid in tree.get_children(parent):
+                found[iid] = bool(tree.item(iid, "open"))
+                visit(iid)
+
+        visit("")
+        return found
 
     def _sync_tree_selection(self) -> None:
         if not self._tree_nodes:
@@ -3715,10 +3749,14 @@ class JianJiApp:
             menu.add_command(label="刷新", command=self._refresh_tree_and_cards)
             return menu
 
-        # 文件夹只有一级，所以**新建文件夹只在「全部文稿」上给**：文件夹上不再有
-        # 「新建子文件夹」，从入口上就杜绝嵌套（用户要求「不可在文件夹下新建文件夹」）。
+        # 文件夹可以多层嵌套（用户要求「多层文件夹预览」）：在「全部文稿」上新建的是
+        # 顶层文件夹，在某个文件夹节点上新建的是它的**子文件夹**。
         if iid == "__all__":
-            menu.add_command(label="新建文件夹…", command=self.new_folder)
+            menu.add_command(label="新建文件夹…",
+                             command=lambda: self.new_folder(self.folder))
+        else:
+            menu.add_command(label="新建子文件夹…",
+                             command=lambda: self.new_folder(Path(iid)))
         target_folder = Path(iid) if iid != "__all__" else self.folder
         if target_folder is not None:
             menu.add_command(label="在资源管理器中打开",
@@ -3820,19 +3858,20 @@ class JianJiApp:
         self._rebuild_tree()
         self.refresh_files()
 
-    def new_folder(self) -> None:
-        """新建一个文件夹——**只建在日记文件夹根下**，与「全部文稿」并列。
+    def new_folder(self, parent: Path | None = None) -> None:
+        """在 `parent` 下新建一个文件夹；不传就建在日记文件夹根下。
 
-        界面上的文件夹只有一级（用户要求），所以这里不接受父目录参数：
-        无论从哪里点进来，新文件夹都落在 `self.folder` 下。
+        从「全部文稿」的菜单进来建在根上（与「全部文稿」并列），
+        从某个文件夹的菜单进来就建在**它里面**——层级可以任意深（用户要求）。
         """
         if self.folder is None:
             return
+        base = parent if parent is not None and parent.is_dir() else self.folder
         name = self._ask_folder_name("新建文件夹", "文件夹名称：")
         if name is None:
             return
         try:
-            created = create_folder(self.folder, name)
+            created = create_folder(base, name)
         except FileExistsError:
             messagebox.showinfo("已存在", "同名文件夹已存在。")
             return
@@ -3923,14 +3962,19 @@ class JianJiApp:
         self.status_label.configure(text=f"已移动到：{self._folder_label(moved)}")
 
     def new_folder_and_move(self, path: Path) -> None:
-        """新建一个文件夹并把文档移进去。文件夹与「全部文稿」并列，只有一级。"""
+        """在文档**所在的那一层**新建一个文件夹，并把文档移进去。
+
+        建在文档自己的父目录下（不是一律建在根上）：文档已经在 `读书/随笔` 里时，
+        把它挪到根上的新文件夹等于**往上搬了一层**，那不是「就近归档」的意思。
+        """
         if self.folder is None:
             return
+        base = path.parent if path.parent.is_dir() else self.folder
         name = self._ask_folder_name("新建文件夹并移动", "新文件夹名称：")
         if name is None:
             return
         try:
-            created = create_folder(self.folder, name)
+            created = create_folder(base, name)
         except FileExistsError:
             messagebox.showinfo("已存在", "同名文件夹已存在，可直接移动到它。")
             return
