@@ -131,6 +131,35 @@ class PlanGuardTests(unittest.TestCase):
         path.write_text("x", encoding="utf-8")
         self.assertEqual(bf.plan(self.tmp, now=NOW), [])
 
+    def test_a_stamped_file_in_a_subfolder_is_included(self) -> None:
+        """子文件夹里的文稿算数——回收站要被跳过，但别顺手把递归也关了。"""
+        nested = self.tmp / "日记"
+        nested.mkdir()
+        path = nested / "2026-09-09 202027.md"
+        path.write_text("正文", encoding="utf-8")
+        storage.set_creation_time(path, moment(2026, 9, 12, 8, 50, 13))
+        self.assertIsNone(self._row(path)["skip"])
+
+    def test_the_recycle_bin_is_left_alone(self) -> None:
+        """回收站里的文件界面上不列，就不该去动它的创建时间。
+
+        踩过一次：`wb01` 预演报「1 篇该改」，那篇其实躺在 `.简记回收站` 底下。
+        根因是清单用了裸 `rglob`，而 `storage.list_markdown` 会跳过隐藏目录。
+        """
+        trash = self.tmp / storage.TRASH_DIR_NAME
+        trash.mkdir()
+        path = trash / "新建-2026-09-12-085114.md"
+        path.write_text("正文", encoding="utf-8")
+        # 创建时间明显偏晚 = 这道闸本来会放它过去
+        storage.set_creation_time(path, moment(2026, 9, 12, 8, 55, 29))
+        import os
+        os.utime(path, (moment(2026, 9, 12, 8, 55, 29),) * 2)
+
+        self.assertEqual(bf.plan(self.tmp, now=NOW), [],
+                         "回收站里的文件不该出现在预演里")
+        self.assertAlmostEqual(storage.creation_time(path),
+                               moment(2026, 9, 12, 8, 55, 29), delta=1.0)
+
 
 class ApplyAndRestoreTests(unittest.TestCase):
     """真的写、以及整体还原。"""

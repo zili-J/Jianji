@@ -32,6 +32,13 @@
 - 戳不能在**未来**；
 - 只处理 `.md`，只处理给定文件夹底下的文件。
 
+## 只认「界面上看得见的文稿」
+
+清单走 `storage.list_markdown(..., recursive=True)`，**不走裸 `rglob`**。
+差别只有一个但很要命：前者会跳过隐藏目录，也就是 `.简记回收站`。
+回收站里的文件界面上不列、用户也点不到，去改它们的创建时间纯属越界
+（踩过一次：`wb01` 预演报的「1 篇」其实是回收站里的文件）。
+
 `--dry-run`（默认）只列不改；`--apply` 才真的写，并先把旧值存成一份 JSON，
 方便整体还原。
 
@@ -86,7 +93,9 @@ def plan(folder: Path, *, now: float | None = None) -> list[dict]:
     """算出「哪些文件的创建时间会被改成什么」。不改任何东西。"""
     now = time.time() if now is None else now
     rows: list[dict] = []
-    for path in sorted(folder.rglob("*.md")):
+    # 用 storage 的清单而不是裸 rglob：它会跳过 `.简记回收站` 这类隐藏目录，
+    # 与界面上列出来的文稿完全一致。
+    for path in sorted(storage.list_markdown(folder, recursive=True)):
         parsed = stamp_from_name(path.stem)
         if parsed is None:
             continue
