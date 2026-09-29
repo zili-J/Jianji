@@ -39,6 +39,12 @@
   修之前用户 12 篇文稿的 `st_ctime` **全部等于** `st_mtime`（「按创建时间排序」因此等于按修改时间）。
   现在每次替换后用 ctypes `SetFileTime` 把旧创建时间写回（`storage.set_creation_time`，best-effort）。
   **别再把这步删掉**，删了「创建日期」会静默退化成假的。
+- **文件名里的时间戳分两种，别认错**：`新建-YYYY-MM-DD-HHMMSS`（简记自己打的，**就是创建时刻**）
+  和 `YYYY-MM-DD HHMMSS`（`文档\日记` 的老约定）可信；`YYYYMMDD-HHMMSS ` 那种**前缀**
+  是**备份/导入时刻**，**不能用**——实测 `20260925-112829 2026-09-09.md` 的文件时间戳是
+  `2026-09-10`，前缀却是 `2026-09-25`，创建不可能晚于修改 15 天。
+  **只有日期没有时刻的戳也别认**（`今日日记20260914.md` 那类，数字常是内容里的日期）。
+  回填工具 `tools/backfill_created.py`（默认预演，`--apply` 才写，`--restore` 可还原）。
 - **`简记使用说明.md` 是测试基准文件，不是普通文档**：`tests/test_export.py::EditorParityTests`
   拿它整篇做「编辑器 vs 导出」逐行对账，并断言它**覆盖全部 10 种块级语法**
   （`heading/text/blank/bullet/ordered/task/quote/code/hr/table`）。重写它必须保留这 10 种。
