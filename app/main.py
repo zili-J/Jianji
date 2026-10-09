@@ -4,7 +4,6 @@ import ctypes
 import os
 import re
 import shutil
-import sys
 import tempfile
 import threading
 import time
@@ -14,6 +13,7 @@ from pathlib import Path
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
 
 import ffmpeg
+import platform_support
 import speech
 from image_export import (
     DEFAULT_BODY_SIZE as EXPORT_BODY_SIZE,
@@ -60,12 +60,23 @@ from storage import (
 )
 
 
-FAMILY = "Microsoft YaHei UI"   # 界面字体：导航、按钮、设置窗口等固定不变
-MONO_FAMILY = "Consolas"        # 代码块等宽字体
+#: 版本号。**打包脚本从这里读**（`build_macos/jianji.spec` 与 `build_dmg.sh` 都用
+#: 正则抓这一行），所以改版本只改这一处，别在别处再抄一份。
+__version__ = "1.0.0"
+
+# 界面字体：导航、按钮、设置窗口等固定不变。**不跟正文联动**，
+# 所以这里选的是各平台自己的系统 UI 字体，而不是 FONT_CANDIDATES 里那几个写作字体。
+FAMILY = "Microsoft YaHei UI" if platform_support.WINDOWS else "PingFang SC"
+# 代码块等宽字体。macOS 上 Menlo 一定在（Monaco 也可以，但 Menlo 更常见）。
+MONO_FAMILY = "Consolas" if platform_support.WINDOWS else "Menlo"
 
 
 class LOGFONTW(ctypes.Structure):
-    """Windows 逻辑字体结构，imm32 用它描述输入法组字的字体。"""
+    """Windows 逻辑字体结构，imm32 用它描述输入法组字的字体。
+
+    **只在 Windows 上有意义**（`_apply_ime_font` 会先看平台），但类本身可以照常
+    定义——`ctypes` 是标准库，非 Windows 上也在。
+    """
 
     _fields_ = [
         ("lfHeight", ctypes.c_long),
@@ -87,6 +98,8 @@ class LOGFONTW(ctypes.Structure):
 
 def _declare_imm32_types() -> None:
     """imm32 里组字相关的函数同样要先声明句柄类型（理由见 _declare_win32_types）。"""
+    if not platform_support.WINDOWS:
+        return
     imm32 = ctypes.windll.imm32
     imm32.ImmGetContext.argtypes = [ctypes.c_void_p]
     imm32.ImmGetContext.restype = ctypes.c_void_p
@@ -103,6 +116,8 @@ def _declare_win32_types() -> None:
     句柄一大就抛 `OverflowError: int too long to convert`。句柄是系统分配的，
     所以这是个「偶尔启动就崩」的隐患——必须显式声明，不能靠运气。
     """
+    if not platform_support.WINDOWS:
+        return
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
     user32.GetDC.argtypes = [ctypes.c_void_p]
@@ -121,7 +136,13 @@ def enable_dpi_awareness() -> float:
     必须在创建任何窗口之前调用。
 
     返回缩放比例：96 DPI（100%）为 1.0，144 DPI（150%）为 1.5。
+
+    **macOS 上没有这一步，也不需要**：Tk 在 Aqua 下的坐标本来就是「点」（1/72 英寸），
+    系统自己按 Retina 的倍率渲染，界面不会被拉伸成位图。所以那边直接返回 1.0，
+    尺寸全部按点算——这是 macOS 应用的原生行为，不是将就。
     """
+    if not platform_support.WINDOWS:
+        return 1.0
     try:
         # PROCESS_PER_MONITOR_DPI_AWARE：Win8.1+
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -157,9 +178,9 @@ def _resolve_scale() -> float:
     """确定界面缩放比例。
 
     即使有环境变量覆盖，也仍然要声明 DPI 感知——否则窗口会被系统拉伸变糊。
+    平台差异全在 `enable_dpi_awareness()` 里（非 Windows 上它直接返回 1.0），
+    所以这里不再自己判平台。
     """
-    if sys.platform != "win32":
-        return 1.0
     detected = enable_dpi_awareness()
     override = _scale_from_env(os.environ.get("JIANJI_SCALE"))
     return override if override is not None else detected
@@ -180,10 +201,32 @@ def px(value: float) -> int:
     return int(value * SCALE + 0.5)
 
 
+def _shortcut_modifiers() -> tuple[str, ...]:
+    """快捷键的修饰键。
+
+    macOS 上主键是 ⌘，但 **Ctrl 也一起绑**——从 Windows 过来的人手会自己去找
+    Ctrl，绑漏了会以为「快捷键在 Mac 上没了」。Windows 上只有 "Control"，
+    所以那边生成的序列与以前一字不差。
+
+    **绑定和「换主题前解绑」都必须走这一份**：两边各写一遍，迟早会漏一个，
+    漏了就是叠绑（按一次存好几次），而且很难看出来。
+    """
+    return ("Control",) if platform_support.WINDOWS else ("Command", "Control")
+
+
+def _reveal_label(verb: str) -> str:
+    """「在资源管理器中显示 / 打开」这类菜单项的文字。
+
+    平台名（资源管理器 / 访达）由 `platform_support` 给，别在菜单里写死。
+    """
+    return f"在{platform_support.FILE_MANAGER_LABEL}中{verb}"
+
+
 # 写作区字体候选：(显示名, 该字体的若干别名)。
-# 中文 Windows 的 font.families() 会返回本地化名称（如「楷体」而不是 KaiTi），
-# 英文系统则返回拉丁名，所以每个候选都列出两种写法，命中任意一个即视为已安装。
-FONT_CANDIDATES: list[tuple[str, tuple[str, ...]]] = [
+# 同一款字体在不同系统上的名字不一样：中文 Windows 的 font.families() 返回本地化名称
+# （如「楷体」而不是 KaiTi），英文 Windows 返回拉丁名，macOS 上还有 PostScript 名 /
+# 全名 / 本地化名三套。所以每个候选都列出几种写法，命中任意一个即视为已安装。
+_WINDOWS_FONTS: list[tuple[str, tuple[str, ...]]] = [
     ("微软雅黑", ("Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑")),
     ("等线", ("DengXian", "等线")),
     ("黑体", ("SimHei", "黑体")),
@@ -194,13 +237,37 @@ FONT_CANDIDATES: list[tuple[str, tuple[str, ...]]] = [
     ("华文楷体", ("STKaiti", "华文楷体")),
     ("幼圆", ("YouYuan", "幼圆")),
     ("隶书", ("LiSu", "隶书")),
-    ("霞鹜文楷", ("LXGW WenKai", "霞鹜文楷", "LXGW WenKai Screen")),
-    ("思源宋体", ("Source Han Serif SC", "思源宋体", "Noto Serif CJK SC")),
-    ("更纱黑体", ("Sarasa Gothic SC", "更纱黑体")),
     ("Consolas", ("Consolas",)),
 ]
 
-DEFAULT_FONT_ALIASES: tuple[str, ...] = ("Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑")
+# macOS 自带的中文字体。**别把 Windows 那份直接拿来用**：SimSun / KaiTi / SimHei
+# 在 macOS 上都不存在，候选表会整个落空，最后退到 Tk 默认字体。
+_MACOS_FONTS: list[tuple[str, tuple[str, ...]]] = [
+    ("苹方", ("PingFang SC", "PingFangSC-Regular", "苹方-简", "苹方")),
+    ("华文黑体", ("Heiti SC", "STHeiti", "华文黑体")),
+    ("宋体-简", ("Songti SC", "STSong", "宋体-简", "宋体")),
+    ("楷体-简", ("Kaiti SC", "STKaiti", "楷体-简", "楷体")),
+    ("华文中宋", ("STZhongsong", "华文中宋")),
+    ("冬青黑体", ("Hiragino Sans GB", "冬青黑体简体中文")),
+    ("Menlo", ("Menlo",)),
+]
+
+# 两个平台都可能装上的第三方字体（思源、更纱是开源的，霞鹜文楷是这个项目的主力字体）。
+_COMMON_FONTS: list[tuple[str, tuple[str, ...]]] = [
+    ("霞鹜文楷", ("LXGW WenKai", "霞鹜文楷", "LXGW WenKai Screen")),
+    ("思源宋体", ("Source Han Serif SC", "思源宋体", "Noto Serif CJK SC")),
+    ("更纱黑体", ("Sarasa Gothic SC", "更纱黑体")),
+]
+
+FONT_CANDIDATES: list[tuple[str, tuple[str, ...]]] = (
+    (_WINDOWS_FONTS if platform_support.WINDOWS else _MACOS_FONTS) + _COMMON_FONTS
+)
+
+# 首次启动（还没存过设置）时的正文默认字体。
+DEFAULT_FONT_ALIASES: tuple[str, ...] = (
+    ("Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑") if platform_support.WINDOWS
+    else ("PingFang SC", "苹方-简", "苹方")
+)
 
 FONT_SAMPLE = "今天的天气很好，我写下这段话。"
 FONT_SAMPLE_LATIN = "Aa Bb Cc 0123 永字八法"
@@ -1872,7 +1939,12 @@ class JianJiApp:
         这一段归 Windows 的输入法管：默认字号是输入法自己那一套，和正文对不上，
         而 Tk 不会把控件字体同步过去，只能自己调 imm32 告诉它。
         属于锦上添花——失败就当没发生，绝不能影响打字。
+
+        **macOS 上没有这一步**：那边的输入法组字由系统自己画，Tk 也管不着，
+        直接返回。所以这个函数在两个平台上都可以随便调。
         """
+        if not platform_support.WINDOWS:
+            return
         try:
             _declare_imm32_types()
             hwnd = int(self.editor.winfo_id())
@@ -1961,13 +2033,15 @@ class JianJiApp:
 
 
     def _bind_shortcuts(self) -> None:
-        self.root.bind("<Control-n>", lambda _event: self.new_document())
-        self.root.bind("<Control-s>", lambda _event: self.save_now())
-        self.root.bind("<Control-o>", lambda _event: self.choose_folder())
-        self.root.bind("<Control-Shift-F>", lambda _event: self.toggle_focus())
+        # 修饰键按平台走（macOS 上 ⌘ + Ctrl 都绑），见 `_shortcut_modifiers`。
+        for prefix in _shortcut_modifiers():
+            self.root.bind(f"<{prefix}-n>", lambda _event: self.new_document())
+            self.root.bind(f"<{prefix}-s>", lambda _event: self.save_now())
+            self.root.bind(f"<{prefix}-o>", lambda _event: self.choose_folder())
+            self.root.bind(f"<{prefix}-Shift-F>", lambda _event: self.toggle_focus())
+            self.editor.bind(f"<{prefix}-b>", self._wrap_bold)
+            self.editor.bind(f"<{prefix}-i>", self._wrap_italic)
         self.root.bind("<Escape>", lambda _event: self._exit_focus())
-        self.editor.bind("<Control-b>", self._wrap_bold)
-        self.editor.bind("<Control-i>", self._wrap_italic)
         # 有序列表的序号续写。绑定在**控件级**（不是 bind_all），
         # 返回 "break" 就吃掉这次回车，不让 Text 的类绑定再插一个换行。
         self.editor.bind("<Return>", self._on_editor_return)
@@ -3165,7 +3239,7 @@ class JianJiApp:
     def _doc_menu(self, path: Path) -> tk.Menu:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="打开", command=lambda: self.open_file(path))
-        menu.add_command(label="在资源管理器中显示", command=lambda: self._reveal(path))
+        menu.add_command(label=_reveal_label("显示"), command=lambda: self._reveal(path))
         # 导出长图原先在顶栏，现在集中到这里：右键哪一篇就导出哪一篇
         menu.add_command(label="导出长图", command=lambda: self.export_long_image(path))
         # 有 ffmpeg 才把 MP3 摆在前面（它是默认格式）；没有就只提 WAV，
@@ -3743,7 +3817,7 @@ class JianJiApp:
     def _tree_menu(self, iid: str) -> tk.Menu:
         menu = tk.Menu(self.root, tearoff=0)
         if iid == "__trash__":
-            menu.add_command(label="在资源管理器中打开", command=lambda: self._reveal(self._trash_folder()))
+            menu.add_command(label=_reveal_label("打开"), command=lambda: self._reveal(self._trash_folder()))
             menu.add_command(label="清空回收站（移到系统回收站）", command=self.empty_trash)
             menu.add_separator()
             menu.add_command(label="刷新", command=self._refresh_tree_and_cards)
@@ -3759,7 +3833,7 @@ class JianJiApp:
                              command=lambda: self.new_folder(Path(iid)))
         target_folder = Path(iid) if iid != "__all__" else self.folder
         if target_folder is not None:
-            menu.add_command(label="在资源管理器中打开",
+            menu.add_command(label=_reveal_label("打开"),
                              command=lambda: self._reveal(target_folder))
         menu.add_separator()
         if iid != "__all__":
@@ -5344,8 +5418,12 @@ class JianJiApp:
 
         # **根窗口上的绑定会一直留着**，重建前必须清掉，否则每换一次主题
         # 就多绑一层，按一次 Ctrl+S 会存好几次。子控件是新建的，不用管。
-        for sequence in ("<Control-n>", "<Control-s>", "<Control-o>",
-                         "<Control-Shift-F>", "<Escape>", "<Destroy>"):
+        # 序列列表由 `_shortcut_modifiers()` 推出来——和 `_bind_shortcuts` 同一份，
+        # 手抄一遍就会在 macOS 上漏掉 Command 那一组，留下叠绑。
+        for prefix in _shortcut_modifiers():
+            for key in ("n", "s", "o", "Shift-F"):
+                self.root.unbind(f"<{prefix}-{key}>")
+        for sequence in ("<Escape>", "<Destroy>"):
             self.root.unbind(sequence)
 
         # 这些缓存都记的是旧控件的几何 / 旧画布的图元，一并作废

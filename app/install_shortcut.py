@@ -1,10 +1,24 @@
 from __future__ import annotations
 
 import ctypes
-import os
 import sys
-from ctypes import wintypes
 from pathlib import Path
+
+import platform_support
+
+# 这个模块整个都是 Windows 专属的（它建的是桌面 `.lnk` 快捷方式，靠 COM 的
+# `IShellLink`）。macOS 上对应的东西是 `.app` 包里的 Info.plist + 拖进「应用程序」，
+# 没有「生成快捷方式」这一步 —— 打包链路在 `build_macos/`。
+#
+# **在 `from ctypes import wintypes` 之前就拦下来**：不然非 Windows 上会抛
+# `ImportError: cannot import name 'wintypes'`，看不出是「平台不对」还是「装坏了」。
+if not platform_support.WINDOWS:
+    raise ImportError(
+        "install_shortcut 只在 Windows 上有意义（它建的是 .lnk 快捷方式）。"
+        "macOS 上用 build_macos/build_dmg.sh 打出 .app / .dmg。"
+    )
+
+from ctypes import wintypes  # noqa: E402
 
 
 HRESULT = ctypes.c_long
@@ -104,6 +118,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    if os.name != "nt":
-        raise SystemExit("Windows only")
     main()

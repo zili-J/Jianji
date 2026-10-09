@@ -15,12 +15,20 @@
 
 ## 为什么不能只靠 `shutil.which`
 
-`shutil.which("ffmpeg")` 只看 PATH 里每一层**本身**有没有 `ffmpeg.exe`。
-可 ffmpeg 的 Windows 包解压出来是 `ffmpeg-xxx/bin/ffmpeg.exe`，很多人图省事
+`shutil.which("ffmpeg")` 只看 PATH 里每一层**本身**有没有 `ffmpeg`。
+Windows 上 ffmpeg 的包解压出来是 `ffmpeg-xxx/bin/ffmpeg.exe`，很多人图省事
 把**解压出来的那个目录**（不是 `bin`）加进 PATH —— 本机就是这样：
 PATH 里有 `D:\\OpenToUseSW\\ffmpeg-master-latest-win64-gpl-shared`，而 exe 在它下面的
 `bin\\` 里，于是 `where ffmpeg` 找不到，但东西其实就在那儿。所以 `_locate()`
 在 PATH 每一层**再往下探一层 `bin\\`**。
+
+## macOS 上还有第二个坑（这个更要命）
+
+从**访达双击**启动的 `.app` 拿不到登录 shell 的 PATH —— 它只有
+`/usr/bin:/bin:/usr/sbin:/sbin`。于是 Homebrew 装在 `/opt/homebrew/bin` 里的
+ffmpeg，在终端里 `which ffmpeg` 找得到，**在简记里就是找不到**。
+所以 macOS 那串 `_COMMON` 不是「顺手多写几个路径」，它是这条链路上唯一能找到
+Homebrew ffmpeg 的地方。删它之前先想清楚这一点。
 """
 from __future__ import annotations
 
@@ -29,21 +37,32 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import platform_support
+
 __all__ = ["FFmpegError", "find", "is_available", "to_mp3"]
 
-#: 起进程时不弹控制台窗口（Windows）。别的平台上是 0。
-_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-
-#: 可以用这个环境变量直接指到某个 ffmpeg.exe，省得去找。
+#: 可以用这个环境变量直接指到某个 ffmpeg，省得去找。
 ENV_VAR = "JIANJI_FFMPEG"
 
-#: PATH 上都没有时，再看这几个常见位置。
-_COMMON = (
-    r"C:\ffmpeg\bin\ffmpeg.exe",
-    r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-    r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-    r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-)
+#: PATH 上都没有时，再看这几个常见位置；以及「PATH 每一层里再往下探」用的文件名。
+if platform_support.MACOS:
+    _COMMON = (
+        "/opt/homebrew/bin/ffmpeg",     # Apple Silicon 上的 Homebrew
+        "/usr/local/bin/ffmpeg",        # Intel 上的 Homebrew
+        "/opt/local/bin/ffmpeg",        # MacPorts
+    )
+    _BINARY_NAMES = ("ffmpeg",)
+elif platform_support.WINDOWS:
+    _COMMON = (
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+    )
+    _BINARY_NAMES = ("ffmpeg.exe", os.path.join("bin", "ffmpeg.exe"))
+else:
+    _COMMON = ()
+    _BINARY_NAMES = ("ffmpeg",)
 
 #: 默认的 MP3 品质（libmp3lame 的 VBR `-q:a`，0 最好、9 最差）。
 #: 2 ≈ 190 kbps。朗读不需要更高，再往上只是白占地方。
@@ -72,7 +91,7 @@ def _locate() -> Path | None:
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry:
             continue
-        for relative in ("ffmpeg.exe", os.path.join("bin", "ffmpeg.exe")):
+        for relative in _BINARY_NAMES:
             candidate = Path(entry) / relative
             if candidate.is_file():
                 return candidate
@@ -85,7 +104,7 @@ def _locate() -> Path | None:
 
 
 def find() -> Path | None:
-    """ffmpeg.exe 的完整路径；找不到返回 `None`。
+    """ffmpeg 可执行文件的完整路径；找不到返回 `None`。
 
     **结果会缓存**：`is_available()` 在导出对话框打开前会被问一次，转换时又问一次，
     每次都把 PATH 翻一遍太浪费。找不到时也缓存（不然每次都要把整个 PATH 走两遍）。
@@ -132,8 +151,8 @@ def to_mp3(source: Path, target: Path, *, quality: int = DEFAULT_QUALITY,
                "-i", str(source), "-codec:a", "libmp3lame", "-q:a", str(quality),
                "-map_metadata", "-1", str(target)]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=timeout,
-                                creationflags=_CREATE_NO_WINDOW)
+        # `creationflags` 只能由 run_quiet 加：macOS 上传这个参数会直接抛 ValueError
+        result = platform_support.run_quiet(command, timeout=timeout)
     except OSError as error:
         raise FFmpegError(f"无法运行 ffmpeg：{error}") from error
     except subprocess.TimeoutExpired as error:

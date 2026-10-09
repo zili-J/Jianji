@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import os
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import platform_support
 
 
 class ExternalChangeError(RuntimeError):
@@ -61,9 +61,9 @@ def replace_with_retry(source: Path, target: Path) -> None:
 
 # --------------------------------------------------------------- 保留创建时间
 #
-# 保存走的是「写临时文件 + `os.replace`」。Windows 上 `os.replace` 是**用源文件
-# 顶掉目标文件**，于是目标文件整个被换成了临时文件 —— 连创建时间也变成临时文件的
-# 创建时间，也就是「这一次保存的时刻」。
+# 保存走的是「写临时文件 + `os.replace`」。而 `os.replace` 是**用源文件顶掉目标
+# 文件**，于是目标文件整个被换成了临时文件 —— 连创建时间也变成临时文件的创建时间，
+# 也就是「这一次保存的时刻」。
 #
 # 后果不是理论推演，是实测：用户文件夹里 12 篇文稿，`st_ctime` **全部等于** `st_mtime`。
 # 这会让两件事同时失效：
@@ -71,58 +71,19 @@ def replace_with_retry(source: Path, target: Path) -> None:
 #   · 「创建日期」永远显示成修改日期，等于没这个信息；
 #   · 「按创建时间排序」与「按修改时间排序」结果完全一样。
 #
-# 所以每次替换之后，把替换前的创建时间写回去。标准库没有「设置创建时间」的接口
-# （`os.utime` 只能改访问时间和修改时间），只能 ctypes 直接调 `SetFileTime`。
+# 所以每次替换之后，把替换前的创建时间写回去。
+#
+# 「怎么读写创建时间」是**平台差异**（Windows 走 `SetFileTime`，macOS 走
+# `setattrlist`，见 `platform_support`），这里只留两个薄壳 —— 因为 `main.py`
+# 和一批测试是按 `storage.creation_time` 这个名字用的，改名会牵一发动全身。
 #
 # 注意：**这只能救回「从今往后」的创建时间**。已经丢掉的没法从文件系统上找回，
 # 因为替换掉的旧文件对象已经不存在了。
 
-_FILETIME_EPOCH = 11_644_473_600   # 1601-01-01 → 1970-01-01 的秒数
-_GENERIC_WRITE = 0x40000000
-_FILE_SHARE_ALL = 0x00000007       # READ | WRITE | DELETE，别把别人的句柄挤掉
-_OPEN_EXISTING = 3
-_FILE_ATTRIBUTE_NORMAL = 0x80
-
-_kernel32: Any = None              # 惰性加载；`False` 表示「试过了，这台机器上没有」
-
-
-def _load_kernel32():
-    """拿到配好原型的 kernel32。非 Windows 或加载失败返回 None。"""
-    global _kernel32
-    if _kernel32 is None:
-        try:
-            from ctypes import wintypes
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            # `CreateFileW` 返回的是句柄，**必须显式声明 `restype`**：ctypes 默认
-            # 按 32 位 int 处理返回值，句柄高位被砍掉，接着就是一个无效句柄。
-            kernel32.CreateFileW.restype = wintypes.HANDLE
-            kernel32.CreateFileW.argtypes = [
-                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-            ]
-            kernel32.SetFileTime.argtypes = [
-                wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
-                ctypes.c_void_p, ctypes.c_void_p,
-            ]
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            _kernel32 = kernel32
-        except (ImportError, AttributeError, OSError, ValueError):
-            _kernel32 = False
-    return _kernel32 or None
-
 
 def creation_time(path: Path) -> float | None:
-    """文件的**创建**时间；拿不到返回 None。
-
-    Windows 上 `st_ctime` 就是创建时间（POSIX 上它是元数据变更时间，语义不同，
-    所以那边直接返回 None，不假装自己有这个信息）。
-    """
-    if os.name != "nt":
-        return None
-    try:
-        return path.stat().st_ctime
-    except OSError:
-        return None
+    """文件的**创建**时间；拿不到返回 None（Linux 上就是拿不到）。"""
+    return platform_support.creation_time(path)
 
 
 def set_creation_time(path: Path, timestamp: float) -> bool:
@@ -130,24 +91,7 @@ def set_creation_time(path: Path, timestamp: float) -> bool:
 
     创建时间是给人看的信息，为它让保存失败不划算。
     """
-    if os.name != "nt":
-        return False
-    kernel32 = _load_kernel32()
-    if kernel32 is None:
-        return False
-    from ctypes import wintypes
-    ticks = int(timestamp * 10_000_000) + _FILETIME_EPOCH * 10_000_000
-    created = wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
-    handle = kernel32.CreateFileW(
-        str(path), _GENERIC_WRITE, _FILE_SHARE_ALL, None,
-        _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
-    )
-    if handle == ctypes.c_void_p(-1).value:      # INVALID_HANDLE_VALUE
-        return False
-    try:
-        return bool(kernel32.SetFileTime(handle, ctypes.byref(created), None, None))
-    finally:
-        kernel32.CloseHandle(handle)
+    return platform_support.set_creation_time(path, timestamp)
 
 
 @dataclass(frozen=True)
@@ -213,13 +157,6 @@ def atomic_write_markdown(
     return saved
 
 
-def default_journal_folder() -> Path:
-    docs = Path.home() / "Documents"
-    if docs.is_dir():
-        return docs / "简记日记"
-    return Path.home() / "简记日记"
-
-
 def new_note_path(folder: Path, now: datetime | None = None) -> Path:
     moment = now or datetime.now()
     stamp = moment.strftime("%Y-%m-%d-%H%M%S")
@@ -238,13 +175,15 @@ def _is_hidden_relative(relative: Path) -> bool:
 
 def _sort_key_of(item: Path, sort_key: str) -> float:
     """取排序用的时间戳；文件刚被移走/删掉时退到 0，别让列表整体崩掉。"""
+    if sort_key == "created":
+        # **必须走 creation_time()**，不能直接读 `st_ctime`：Windows 上它是创建时间，
+        # 但 macOS/Linux 上它是**元数据变更时间**（改权限、改名都会动它），
+        # 拿它当「创建时间」排出来的顺序是错的，而且错得不明显。
+        return creation_time(item) or 0.0
     try:
-        info = item.stat()
+        return item.stat().st_mtime
     except OSError:
         return 0.0
-    # Windows 上 st_ctime 就是**创建时间**（POSIX 上它是元数据变更时间，
-    # 但这是 Windows 桌面应用，取创建时间正是想要的）。
-    return info.st_ctime if sort_key == "created" else info.st_mtime
 
 
 def list_markdown(folder: Path, recursive: bool = False,
@@ -355,45 +294,15 @@ def count_files(folder: Path) -> int:
 
 
 def delete_to_recycle_bin(path: Path) -> None:
-    """把文件或文件夹移到回收站；不做永久删除，失败即报错。"""
+    """把文件或文件夹移到**系统**回收站；不做永久删除，失败即报错。
+
+    Windows 走 `SHFileOperationW`、macOS 走「移进 `~/.Trash`，必要时交给访达」——
+    两边都在 `platform_support.move_to_system_trash` 里。
+    """
     target = Path(path)
     if not target.exists():
         raise FileNotFoundError(f"目标不存在：{target}")
-    if os.name != "nt":
-        raise OSError("当前系统不支持移到回收站，已取消删除。")
-
-    import ctypes
-    from ctypes import wintypes
-
-    class SHFILEOPSTRUCTW(ctypes.Structure):
-        _fields_ = [
-            ("hwnd", wintypes.HWND),
-            ("wFunc", wintypes.UINT),
-            ("pFrom", wintypes.LPCWSTR),
-            ("pTo", wintypes.LPCWSTR),
-            ("fFlags", ctypes.c_uint16),
-            ("fAnyOperationsAborted", wintypes.BOOL),
-            ("hNameMappings", ctypes.c_void_p),
-            ("lpszProgressTitle", wintypes.LPCWSTR),
-        ]
-
-    FO_DELETE = 3
-    FOF_ALLOWUNDO = 0x40
-    FOF_NOCONFIRMATION = 0x10
-    FOF_SILENT = 0x4
-    FOF_NOERRORUI = 0x400
-
-    operation = SHFILEOPSTRUCTW()
-    operation.hwnd = None
-    operation.wFunc = FO_DELETE
-    operation.pFrom = str(target) + "\x00\x00"
-    operation.pTo = None
-    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
-    code = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
-    if code != 0:
-        raise OSError(f"移到回收站失败（错误码 {code}）")
-    if operation.fAnyOperationsAborted:
-        raise OSError("删除操作被中止。")
+    platform_support.move_to_system_trash(target)
 
 
 TRASH_DIR_NAME = ".简记回收站"
@@ -502,15 +411,12 @@ def purge_trash_entry(root: Path, trash_name: str) -> None:
 
 
 def reveal_in_explorer(path: Path) -> None:
-    target = Path(path)
-    if os.name != "nt":
-        raise OSError("当前系统不支持打开资源管理器。")
-    if not target.exists():
-        raise FileNotFoundError(f"目标不存在：{target}")
-    if target.is_dir():
-        os.startfile(str(target))  # type: ignore[attr-defined]
-    else:
-        subprocess.Popen(["explorer", f"/select,{target}"])
+    """在系统文件管理器里选中它。
+
+    名字里的 `explorer` 是历史包袱（当年只有 Windows），没改名是因为
+    `main.py` 和两个测试模块都按这个名字引用它；macOS 上它走的是访达。
+    """
+    platform_support.reveal_in_file_manager(path)
 
 
 def default_journal_folder(home: Path | None = None) -> Path:
@@ -519,8 +425,9 @@ def default_journal_folder(home: Path | None = None) -> Path:
 
 
 def default_state_path() -> Path:
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    return base / "JianJi" / "state.json"
+    """设置文件的位置。Windows 是 `%LOCALAPPDATA%\\JianJi`，
+    macOS 是 `~/Library/Application Support/JianJi`（见 `platform_support`）。"""
+    return platform_support.default_state_path()
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:

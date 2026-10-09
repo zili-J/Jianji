@@ -17,3 +17,12 @@ outputs/*
 # ---- Windows ----
 Thumbs.db
 desktop.ini
+
+# ---- macOS 打包（build_macos/build_dmg.sh 产出）----
+# 构建环境、PyInstaller 的中间目录、以及 .app / .dmg 成品都不入库：
+# 全是可重生成的，而且 dmg 动辄几十 MB。
+# 注意 `build/` 只匹配同名目录，不会连累 `build_macos/`。
+.build-venv/
+build/
+dist/
+*.dmg

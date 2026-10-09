@@ -63,17 +63,42 @@ SAPI5 支持 SSML，`ISpVoice::Speak` 带 `SVSF_IS_XML`（= 8）标志时就把�
 
 语速走 `voice.Rate`（和原来同一个旋钮），**不放进 SSML 的 `<prosody rate>`**：
 两个地方各设一次会叠乘，调起来对不上账。
-"""
 
+## macOS 上换成什么
+
+macOS 没有 SAPI，系统自带的朗读引擎是命令行的 `say`（`/usr/bin/say`）。
+上面那三件事它都做得到，只是**标记语言的方言不同**：
+
+| 这件事 | Windows（SAPI） | macOS（say） |
+|---|---|---|
+| 停顿 | `<break time='450ms'/>` | `[[slnc 450]]` |
+| 语速 | `voice.Rate`（-10..10 相对档位） | `-r`（词/分钟，绝对值） |
+| 音色 | 系统默认（本来就是中文） | `-v`，自己挑一个 `zh_CN` |
+| 出 WAV | `SpFileStream` | `-o 文件 --file-format=WAVE --data-format=LEI16@22050` |
+
+`build_ssml()` 这个名字在两个平台上都保留（它干的事是「造引擎认得的那套标记」），
+只是 macOS 上返回的不是 XML。`synthesize(..., xml=True)` 的语义相应变成
+「入参**已经是**引擎标记，别再当纯文本处理」—— 这个含义两平台一致。
+
+**音量在 macOS 上没有对应物**：`say` 不接受音量参数，`volume` 会被忽略。
+"""
 from __future__ import annotations
 
 import ctypes
 import os
 import re
+import subprocess
+import tempfile
 import wave
-import winreg
 from ctypes import POINTER, byref, c_void_p
 from pathlib import Path
+
+import platform_support
+
+if platform_support.WINDOWS:
+    import winreg
+else:                                        # macOS / Linux 上没有 winreg
+    winreg = None                            # type: ignore[assignment]
 
 __all__ = ["SpeechError", "build_ssml", "default_voice_name", "is_available",
            "synthesize", "wav_seconds",
@@ -85,9 +110,46 @@ class SpeechError(RuntimeError):
 
 
 # ---------------------------------------------------------------- COM 基础设施
+#
+# 下面这一整段是 **Windows 专用**的：`ole32` / `oleaut32` 只有 Windows 有。
+# 可它们的 argtypes 声明在**模块顶层**，import 时就会跑一遍 —— 而 `speech`
+# 是被 `main` 无条件导入的，所以非 Windows 上必须在 import 阶段就绕开。
+#
+# 做法不是给那三百行 COM 代码整体包一层 `if`（那要把整个文件缩进一遍，
+# Windows 那边一行行都得跟着重排，改动面反而更大），而是给这两个 DLL 换一个
+# **惰性替身**：属性随便设（argtypes/restype 声明照跑），真去调用就抛
+# `SpeechError`。COM 那部分在 macOS 上永远走不到（`is_available()` 直接返回
+# False），替身只需要做到「让 import 活下来」+「万一被误调到要说人话」。
 
-_ole32 = ctypes.WinDLL("ole32")
-_oleaut32 = ctypes.WinDLL("oleaut32")
+
+class _UnavailableFunction:
+    """替身里的一个「函数」：接受任何属性设置，一调用就报错。"""
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, "_name", name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_name":
+            object.__setattr__(self, name, value)
+
+    def __call__(self, *_args, **_kwargs):
+        raise SpeechError(
+            f"Windows 专用的语音接口（{self._name}）在这个平台上不可用。")
+
+
+class _UnavailableDll:
+    """非 Windows 上顶替 `ole32` / `oleaut32` 的占位。"""
+
+    def __getattr__(self, name: str) -> _UnavailableFunction:
+        return _UnavailableFunction(name)
+
+
+if platform_support.WINDOWS:
+    _ole32 = ctypes.WinDLL("ole32")
+    _oleaut32 = ctypes.WinDLL("oleaut32")
+else:
+    _ole32 = _UnavailableDll()               # type: ignore[assignment]
+    _oleaut32 = _UnavailableDll()            # type: ignore[assignment]
 
 # **必须显式声明**：见模块开头第 1 条坑
 _oleaut32.SysAllocString.restype = c_void_p
@@ -321,6 +383,155 @@ class _Apartment:
         return None
 
 
+# ------------------------------------------------------- 朗读节奏（两个平台共用）
+
+#: 默认语速。0 是 SAPI 的「正常」，可中文听下来偏快、偏赶；**降一档**明显更像
+#: 人说话。范围 -10..10，再慢就要拖长腔了。macOS 上按 `SAY_WPM_PER_STEP` 换算成
+#: `say -r` 的绝对值（见 `SAY_BASE_WPM`）。
+NATURAL_RATE = -1
+
+#: 段间停顿（毫秒）。正文里的空行 = 换段，念到这里停这么久。
+PARAGRAPH_BREAK_MS = 450
+
+#: 句末停顿（毫秒）。SAPI 自己也会停，但停得又短又齐，补一点点就够；
+#: 补多了会把一句话切碎，反而更假。
+SENTENCE_BREAK_MS = 160
+
+#: 段**内**的换行（列表项、多行短句）停顿，比段间短。
+LINE_BREAK_MS = 260
+
+#: 句末标点。**只认强停顿**：逗号顿号不加，SAPI 本来就会在逗号上停一下，
+#: 再插一个 `<break>` 会把句子切得一顿一顿的。
+_SENTENCE_END_RE = re.compile(r"([。！？；…!?;])")
+
+
+# ------------------------------------------------------------------ macOS 后端
+
+#: macOS 的系统朗读引擎。**用绝对路径**：从访达启动的 `.app` 拿不到登录 shell
+#: 的 PATH，`shutil.which("say")` 在那种情况下会失败，而它一直都在 `/usr/bin` 里。
+SAY = "/usr/bin/say"
+
+#: `say` 的语速单位是「词/分钟」，SAPI 用的是 -10..10 的相对档位。
+#: `NATURAL_RATE = -1` 换算过来是 155 词/分：`say` 默认的 175 对中文偏赶，
+#: 再降到 140 又发闷。这两个数是听着调的，不是从文档里抄的。
+SAY_BASE_WPM = 175
+SAY_WPM_PER_STEP = 20
+SAY_MIN_WPM = 90
+
+#: `[[slnc N]]` 是 `say` 的「插入 N 毫秒静音」，也是它**唯一**的停顿手段。
+_SAY_SILENCE_TAIL_RE = re.compile(r"(?:\[\[slnc \d+\]\])+$")
+
+_say_voice: object = False                   # False = 还没查过；None = 查过但没有
+
+
+def _say_silence(milliseconds: int) -> str:
+    """一段静音标记。和 `_gap()` 一个规矩：**0 就返回空串**，不留半个标记。"""
+    return f"[[slnc {milliseconds}]]" if milliseconds > 0 else ""
+
+
+def _say_wpm(rate: int) -> int:
+    """把 SAPI 的相对档位（-10..10）换算成 `say -r` 的**绝对值**词/分。
+
+    两边不是同一个量纲：`voice.Rate` 是「比正常快/慢几档」，`-r` 是绝对的
+    词/分。所以这里既要有基准（`SAY_BASE_WPM`）也要有每档的步长，还得有个下限
+    ——再往下 `say` 会拖成一条一条的。
+    """
+    return max(SAY_MIN_WPM, SAY_BASE_WPM + rate * SAY_WPM_PER_STEP)
+
+
+def _say_available() -> bool:
+    return Path(SAY).is_file()
+
+
+def _say_voice_name() -> str | None:
+    """挑一个中文音色，查一次就缓存。
+
+    **不指定 `-v` 是不行的**：`say` 的默认音色多半是英文的，拿它念中文会得到
+    一串莫名其妙的音节。`say -v ?` 输出「名字 语言 # 说明」三列，取第一个
+    `zh_CN` 的。
+    """
+    global _say_voice
+    if _say_voice is not False:
+        return _say_voice                       # type: ignore[return-value]
+    _say_voice = None
+    if not _say_available():
+        return None
+    try:
+        result = platform_support.run_quiet([SAY, "-v", "?"], timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = (result.stdout or b"").decode("utf-8", "replace")
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].startswith("zh_CN"):
+            _say_voice = parts[0]
+            break
+    return _say_voice                           # type: ignore[return-value]
+
+
+def build_say_script(text: str, *, paragraph_break_ms: int = PARAGRAPH_BREAK_MS,
+                     sentence_break_ms: int = SENTENCE_BREAK_MS,
+                     line_break_ms: int = LINE_BREAK_MS) -> str:
+    """macOS 版的「带停顿的朗读稿」：正文 + `[[slnc N]]`。
+
+    停顿的落点和 `_build_sapi_ssml()` **完全一致**（空行 = 段间、段内换行 =
+    行间、`。！？；…` 之后 = 句末），因为两边读的是同一份 `speakable_text()`
+    输出。耳朵听到的节奏因此与平台无关。
+
+    **不需要转义**：`say` 不吃 XML，`<`、`&` 原样念出来就行。唯一的例外是正文
+    里正好写了 `[[...]]` —— 那会被 `say` 当成嵌入命令。中文日记里基本不会出现，
+    没有为它加转义。
+    """
+    blocks: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text.strip()):
+        lines = [line.strip() for line in paragraph.split("\n") if line.strip()]
+        if not lines:
+            continue
+        body = (_say_silence(line_break_ms) or "\n").join(lines)
+        if sentence_break_ms:
+            body = _SENTENCE_END_RE.sub(
+                lambda match: f"{match.group(1)}{_say_silence(sentence_break_ms)}", body)
+            body = _SAY_SILENCE_TAIL_RE.sub("", body)
+        blocks.append(body)
+    return (_say_silence(paragraph_break_ms) or "\n").join(blocks)
+
+
+def _synthesize_macos(text: str, target: Path, *, rate: int, timeout_ms: int) -> int:
+    """跑 `say` 把文字合成到 WAV。**会阻塞**，调用方必须放后台线程。"""
+    # 正文走 `-f 文件` 而不是命令行参数：一篇日记上千字，塞进 argv 既可能撞上
+    # 长度上限，又会被以 `-` 开头的正文当成选项。
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", encoding="utf-8", delete=False,
+        dir=tempfile.gettempdir(), prefix="jianji-say-")
+    script = Path(handle.name)
+    try:
+        with handle:
+            handle.write(text)
+        command = [SAY, "-f", str(script)]
+        voice = _say_voice_name()
+        if voice:
+            command += ["-v", voice]
+        command += ["-r", str(_say_wpm(rate))]
+        # 固定成 22.05kHz 16 位单声道 WAV：`wave` 模块和后面的 ffmpeg 都认这个。
+        command += ["--file-format=WAVE", "--data-format=LEI16@22050"]
+        command += ["-o", str(target)]
+        try:
+            result = platform_support.run_quiet(
+                command, timeout=max(30.0, timeout_ms / 1000))
+        except OSError as error:
+            raise SpeechError(f"无法运行 say：{error}") from error
+        except subprocess.TimeoutExpired as error:
+            raise SpeechError("语音合成超时。") from error
+        if result.returncode != 0:
+            detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+            raise SpeechError(f"say 返回 {result.returncode}：{detail[-300:]}")
+    finally:
+        script.unlink(missing_ok=True)
+    if not target.exists():
+        raise SpeechError("语音引擎没有写出文件，可能没有可用的音色。")
+    return target.stat().st_size
+
+
 # ------------------------------------------------------------------ 对外接口
 
 _VOICE_KEY = r"SOFTWARE\Microsoft\Speech\Voices"
@@ -330,7 +541,12 @@ def default_voice_name() -> str | None:
     """系统默认音色的描述串，例如 `Microsoft Huihui Desktop - Chinese (Simplified)`。
 
     只读注册表、不碰 COM —— 用来在状态栏告诉用户「用哪个声音念的」。
+    macOS 上返回挑中的那个中文音色名（见 `_say_voice_name`）。
     """
+    if platform_support.MACOS:
+        return _say_voice_name()
+    if not platform_support.WINDOWS:
+        return None
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _VOICE_KEY) as key:
             token_id = winreg.QueryValueEx(key, "DefaultTokenId")[0]
@@ -349,7 +565,9 @@ def default_voice_name() -> str | None:
 
 def is_available() -> bool:
     """这台机器有没有可用的语音引擎。任何异常都当成「没有」。"""
-    if os.name != "nt":                     # pragma: no cover - 只在 Windows 上跑
+    if platform_support.MACOS:
+        return _say_available()
+    if not platform_support.WINDOWS:        # pragma: no cover - 只支持 Win / macOS
         return False
     try:
         with _Apartment():
@@ -359,25 +577,7 @@ def is_available() -> bool:
         return False
 
 
-# ------------------------------------------------------------- 让它别那么机械
-
-#: 默认语速。0 是 SAPI 的「正常」，可中文听下来偏快、偏赶；**降一档**明显更像
-#: 人说话。范围 -10..10，再慢就要拖长腔了。
-NATURAL_RATE = -1
-
-#: 段间停顿（毫秒）。正文里的空行 = 换段，念到这里停这么久。
-PARAGRAPH_BREAK_MS = 450
-
-#: 句末停顿（毫秒）。SAPI 自己也会停，但停得又短又齐，补一点点就够；
-#: 补多了会把一句话切碎，反而更假。
-SENTENCE_BREAK_MS = 160
-
-#: 段**内**的换行（列表项、多行短句）停顿，比段间短。
-LINE_BREAK_MS = 260
-
-#: 句末标点。**只认强停顿**：逗号顿号不加，SAPI 本来就会在逗号上停一下，
-#: 再插一个 `<break>` 会把句子切得一顿一顿的。
-_SENTENCE_END_RE = re.compile(r"([。！？；…!?;])")
+# ----------------------------------------------------- SSML（Windows 的停顿标记）
 
 _SSML_ESCAPE = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 _BREAK_TAG_RE = re.compile(r"(?:<break time='\d+ms'/>)+$")
@@ -403,7 +603,26 @@ def _gap(milliseconds: int) -> str:
 def build_ssml(text: str, *, paragraph_break_ms: int = PARAGRAPH_BREAK_MS,
                sentence_break_ms: int = SENTENCE_BREAK_MS,
                line_break_ms: int = LINE_BREAK_MS) -> str:
-    """把正文转成带停顿的 SSML，交给 `synthesize(..., xml=True)`。
+    """把正文转成**引擎认得的那套带停顿的标记**，交给 `synthesize(..., xml=True)`。
+
+    名字里虽然有 SSML，macOS 上返回的却**不是 XML** —— 那边 `say` 用的是
+    `[[slnc N]]`（见 `build_say_script`）。对调用方来说两件事是一回事：
+    「这是标记，别再当纯文本处理」。停顿落在哪儿两个平台完全一致，
+    因为两边读的是同一份 `speakable_text()` 输出。
+    """
+    if platform_support.MACOS:
+        return build_say_script(text, paragraph_break_ms=paragraph_break_ms,
+                                sentence_break_ms=sentence_break_ms,
+                                line_break_ms=line_break_ms)
+    return _build_sapi_ssml(text, paragraph_break_ms=paragraph_break_ms,
+                            sentence_break_ms=sentence_break_ms,
+                            line_break_ms=line_break_ms)
+
+
+def _build_sapi_ssml(text: str, *, paragraph_break_ms: int = PARAGRAPH_BREAK_MS,
+                     sentence_break_ms: int = SENTENCE_BREAK_MS,
+                     line_break_ms: int = LINE_BREAK_MS) -> str:
+    """（Windows）把正文转成带 `<break>` 的 SSML。
 
     停顿是照着 `speakable_text()` 的输出结构来的（空行分段、段内单换行分行），
     所以正文里的排版节奏会原样传到耳朵里：
@@ -442,9 +661,14 @@ def synthesize(text: str, path: Path, *, rate: int = 0, volume: int = 100,
     `rate` 是语速（-10..10，0 为正常），`volume` 是音量（0..100）。
     音色用系统默认（本机是中文音色，见模块开头的「音色」一节）。
 
-    `xml=True` 时 `text` 按 **SSML** 解析（`build_ssml()` 产出的那种），
+    `xml=True` 时 `text` 按**引擎标记**处理（`build_ssml()` 产出的那种），
     可以带 `<break>`、`<prosody>` 这些标签。**默认的 `False` 走纯文本**——
     正文里正好出现一个 `<` 时不会被当成标签吞掉。
+
+    macOS 上这个参数的含义不变（「入参已经是标记，别再当纯文本」），只是那边
+    的标记是 `[[slnc N]]` 而不是 XML —— `say` 本来就不解析 XML。
+
+    `volume` 在 macOS 上**会被忽略**：`say` 没有音量参数。
 
     **会阻塞**，直到整篇念完。合成比排版慢得多（语速按每秒 5 个汉字估），
     长文可能要好几分钟，调用方必须放到后台线程里跑，别卡住界面。
@@ -456,6 +680,9 @@ def synthesize(text: str, path: Path, *, rate: int = 0, volume: int = 100,
     target.parent.mkdir(parents=True, exist_ok=True)
     if timeout_ms is None:
         timeout_ms = max(60_000, int(len(text) / 5 * 1000 * 4))
+
+    if platform_support.MACOS:
+        return _synthesize_macos(text, target, rate=rate, timeout_ms=timeout_ms)
 
     with _Apartment():
         stream = voice = None

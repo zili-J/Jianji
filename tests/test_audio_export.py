@@ -25,6 +25,7 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "app"))
 
+import platform_support  # noqa: E402
 import storage  # noqa: E402
 
 # **这一行必须在下面的探针之前。** `main` 导入时会声明进程 DPI 感知
@@ -187,6 +188,190 @@ class SsmlTests(unittest.TestCase):
         ET.fromstring(self.speech.build_ssml("   \n\n  "))
 
 
+class _MacOSPatch:
+    """临时把 `platform_support` 的平台常量改成 macOS。
+
+    能这么干，是因为 `build_ssml()` / `synthesize()` 都是**调用时**去读
+    `platform_support.MACOS` 的，不是导入时算死的。于是 macOS 的 `[[slnc]]`
+    分支在 Windows 上也测得了。
+    """
+
+    def __enter__(self):
+        self.saved = (platform_support.WINDOWS, platform_support.MACOS,
+                      platform_support.LINUX)
+        (platform_support.WINDOWS, platform_support.MACOS,
+         platform_support.LINUX) = (False, True, False)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        (platform_support.WINDOWS, platform_support.MACOS,
+         platform_support.LINUX) = self.saved
+        return None
+
+
+class SayScriptTests(unittest.TestCase):
+    """macOS 的「带停顿的朗读稿」：`[[slnc N]]` 而不是 `<break>`。
+
+    这一组是**对着 `SsmlTests` 逐条写的**，因为两边读的是同一份
+    `speakable_text()` 输出，停顿必须落在同一个地方——耳朵听到的节奏与平台无关。
+    改了一边就要想另一边；`BackendParityTests` 管的是接口，管不了这里。
+    """
+
+    def setUp(self) -> None:
+        import speech
+
+        self.speech = speech
+
+    def test_the_platform_patch_is_really_in_effect(self) -> None:
+        """先钉住补丁本身——没生效的话下面每一条都会「通过」得毫无意义。"""
+        self.assertFalse(platform_support.MACOS)
+        with _MacOSPatch():
+            self.assertTrue(platform_support.MACOS)
+            self.assertFalse(platform_support.WINDOWS)
+            self.assertIn("[[slnc", self.speech.build_ssml("第一段。\n\n第二段。"))
+        self.assertFalse(platform_support.MACOS)
+
+    def test_the_result_is_not_xml(self) -> None:
+        """`say` 不解析 XML，正文里原样的 `<`、`&` 不会被吞掉、也不用转义。"""
+        with _MacOSPatch():
+            script = self.speech.build_ssml("a < b & c")
+        self.assertNotIn("<speak", script)
+        self.assertIn("a < b & c", script)
+
+    def test_a_blank_line_becomes_a_longer_pause(self) -> None:
+        with _MacOSPatch():
+            script = self.speech.build_say_script("第一段。\n\n第二段。")
+        self.assertIn(f"[[slnc {self.speech.PARAGRAPH_BREAK_MS}]]", script)
+
+    def test_a_single_newline_becomes_a_shorter_pause(self) -> None:
+        with _MacOSPatch():
+            script = self.speech.build_say_script("第一项\n第二项")
+        self.assertIn(f"[[slnc {self.speech.LINE_BREAK_MS}]]", script)
+
+    def test_sentence_enders_get_a_short_pause(self) -> None:
+        with _MacOSPatch():
+            script = self.speech.build_say_script("甲。乙！丙？")
+        self.assertEqual(script.count(f"[[slnc {self.speech.SENTENCE_BREAK_MS}]]"), 2)
+
+    def test_a_comma_does_not_get_a_pause(self) -> None:
+        with _MacOSPatch():
+            script = self.speech.build_say_script("甲，乙，丙")
+        self.assertNotIn("[[slnc", script)
+
+    def test_zero_turns_every_pause_off(self) -> None:
+        """「关掉停顿」必须真的回到纯文本，否则对照核验是假的。"""
+        with _MacOSPatch():
+            script = self.speech.build_say_script(
+                "第一段。\n\n第二段！", paragraph_break_ms=0,
+                sentence_break_ms=0, line_break_ms=0)
+        self.assertNotIn("[[slnc", script)
+        self.assertEqual(script, "第一段。\n第二段！")
+
+    def test_a_pause_at_the_end_of_a_paragraph_is_dropped(self) -> None:
+        """段尾句号那个停顿会和段间停顿叠一起，去掉一个。"""
+        with _MacOSPatch():
+            script = self.speech.build_say_script("只有一段。")
+        self.assertNotIn("[[slnc", script)
+
+    def test_zero_milliseconds_returns_no_marker(self) -> None:
+        """和 `_gap(0)` 一个规矩：不留半个标记。"""
+        self.assertEqual(self.speech._say_silence(0), "")
+        self.assertEqual(self.speech._say_silence(-1), "")
+        self.assertEqual(self.speech._say_silence(450), "[[slnc 450]]")
+
+    def test_the_rate_is_converted_to_absolute_wpm(self) -> None:
+        """`say -r` 是绝对的词/分，SAPI 的 `voice.Rate` 是相对档位。
+
+        两边量纲不同，所以这个换算必须只此一处（`_say_wpm`），别在调用点重算。
+        """
+        self.assertEqual(self.speech._say_wpm(0), self.speech.SAY_BASE_WPM)
+        self.assertEqual(self.speech._say_wpm(-1),
+                         self.speech.SAY_BASE_WPM - self.speech.SAY_WPM_PER_STEP)
+        self.assertEqual(self.speech._say_wpm(self.speech.NATURAL_RATE),
+                         self.speech.SAY_BASE_WPM
+                         + self.speech.NATURAL_RATE * self.speech.SAY_WPM_PER_STEP)
+
+    def test_an_absurdly_slow_rate_is_clamped(self) -> None:
+        self.assertEqual(self.speech._say_wpm(-99), self.speech.SAY_MIN_WPM)
+
+    def test_synthesize_macos_builds_the_expected_command(self) -> None:
+        """把 `say` 的命令行钉死。
+
+        正文必须走 `-f 文件`（日记上千字会撞 argv 长度上限，且以 `-` 开头的
+        正文会被当成选项）；输出格式必须**显式指定**，否则 `wave` 模块和后面的
+        ffmpeg 认不出来。
+        """
+        import platform_support as ps
+
+        seen: dict[str, object] = {}
+        saved_quiet = ps.run_quiet
+        saved_voice = self.speech._say_voice
+
+        def shim(command, **kwargs):
+            seen["command"] = list(command)
+            target = Path(command[command.index("-o") + 1])
+            target.write_bytes(b"RIFF")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        ps.run_quiet = shim
+        self.speech._say_voice = "Ting-Ting"
+        try:
+            with _MacOSPatch(), tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "out.wav"
+                written = self.speech.synthesize(
+                    "甲。乙", target, rate=self.speech.NATURAL_RATE, xml=True)
+        finally:
+            ps.run_quiet = saved_quiet
+            self.speech._say_voice = saved_voice
+
+        command = seen["command"]
+        self.assertEqual(command[0], self.speech.SAY)
+        self.assertIn("-f", command)                    # 正文走文件，不塞 argv
+        self.assertEqual(command[command.index("-v") + 1], "Ting-Ting")
+        self.assertEqual(command[command.index("-r") + 1],
+                         str(self.speech._say_wpm(self.speech.NATURAL_RATE)))
+        self.assertIn("--file-format=WAVE", command)
+        self.assertIn("--data-format=LEI16@22050", command)
+        self.assertEqual(written, 4)
+
+    def test_synthesize_macos_cleans_up_the_script_file(self) -> None:
+        """传给 `-f` 的那个临时稿子不能留在临时目录里。"""
+        import platform_support as ps
+
+        seen: dict[str, object] = {}
+        saved_quiet = ps.run_quiet
+
+        def shim(command, **kwargs):
+            seen["script"] = Path(command[command.index("-f") + 1])
+            Path(command[command.index("-o") + 1]).write_bytes(b"RIFF")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        ps.run_quiet = shim
+        try:
+            with _MacOSPatch(), tempfile.TemporaryDirectory() as tmp:
+                self.speech.synthesize("甲。乙", Path(tmp) / "out.wav", xml=True)
+        finally:
+            ps.run_quiet = saved_quiet
+        self.assertFalse(seen["script"].exists())
+
+    def test_a_missing_say_binary_is_reported_not_raised_as_oserror(self) -> None:
+        """`say` 不在（非 macOS 上跑、或被裁剪过的系统）要报成 `SpeechError`。"""
+        import platform_support as ps
+
+        saved_quiet = ps.run_quiet
+
+        def shim(command, **kwargs):
+            raise FileNotFoundError("say")
+
+        ps.run_quiet = shim
+        try:
+            with _MacOSPatch(), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(self.speech.SpeechError):
+                    self.speech.synthesize("甲。乙", Path(tmp) / "out.wav")
+        finally:
+            ps.run_quiet = saved_quiet
+
+
 class FFmpegModuleTests(unittest.TestCase):
     """`app/ffmpeg.py`：找得到就转，找不到就安静地不转（不能崩、不能抛）。"""
 
@@ -258,24 +443,27 @@ class FFmpegModuleTests(unittest.TestCase):
         target = tmp / "out.mp3"
         seen: dict = {}
 
-        class _Shim:
-            """换掉整个 `subprocess` 模块，免得动到真的那一个。"""
-            TimeoutExpired = subprocess.TimeoutExpired
+        def _shim(command, **kwargs):
+            """换掉平台层那个包装，免得真起进程。
 
-            @staticmethod
-            def run(command, **kwargs):
-                seen["command"] = command
-                seen["kwargs"] = kwargs
-                target.write_bytes(b"ID3")
-                return subprocess.CompletedProcess(command, 0, b"", b"")
+            换的是 `platform_support.run_quiet` 而不是 `subprocess.run`：
+            起进程这一层现在统一走平台层（它负责在 Windows 上加
+            `creationflags`，在 macOS 上**不能**加 —— 那边传这个参数会直接
+            抛 `ValueError`）。「不能弹黑框」那条断言因此搬到了
+            `tests/test_platform.py`，那里才是加它的地方。
+            """
+            seen["command"] = command
+            seen["kwargs"] = kwargs
+            target.write_bytes(b"ID3")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
 
         self.ffmpeg.find = lambda: Path(r"C:\fake\ffmpeg.exe")
-        original = self.ffmpeg.subprocess
-        self.ffmpeg.subprocess = _Shim
+        original = platform_support.run_quiet
+        platform_support.run_quiet = _shim
         try:
             size = self.ffmpeg.to_mp3(source, target)
         finally:
-            self.ffmpeg.subprocess = original
+            platform_support.run_quiet = original
 
         self.assertEqual(size, 3)
         command = seen["command"]
@@ -284,29 +472,23 @@ class FFmpegModuleTests(unittest.TestCase):
         self.assertIn("-map_metadata", command)
         self.assertEqual(command[command.index("-map_metadata") + 1], "-1")
         self.assertEqual(command[-1], str(target))
-        # 不能弹黑框
-        self.assertEqual(seen["kwargs"]["creationflags"], self.ffmpeg._CREATE_NO_WINDOW)
 
     def test_to_mp3_reports_a_nonzero_exit(self) -> None:
         tmp = Path(tempfile.mkdtemp())
         source = tmp / "in.wav"
         source.write_bytes(b"RIFF")
 
-        class _Shim:
-            TimeoutExpired = subprocess.TimeoutExpired
-
-            @staticmethod
-            def run(command, **_kwargs):
-                return subprocess.CompletedProcess(command, 1, b"", b"boom")
+        def _shim(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 1, b"", b"boom")
 
         self.ffmpeg.find = lambda: Path(r"C:\fake\ffmpeg.exe")
-        original = self.ffmpeg.subprocess
-        self.ffmpeg.subprocess = _Shim
+        original = platform_support.run_quiet
+        platform_support.run_quiet = _shim
         try:
             with self.assertRaises(self.ffmpeg.FFmpegError) as caught:
                 self.ffmpeg.to_mp3(source, tmp / "out.mp3")
         finally:
-            self.ffmpeg.subprocess = original
+            platform_support.run_quiet = original
         self.assertIn("boom", str(caught.exception))
 
 
