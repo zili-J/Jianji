@@ -433,3 +433,42 @@
 - **起外部进程要 `creationflags=CREATE_NO_WINDOW`**（0x08000000），否则闪黑框——这正是 `speech.py` 当初
   绕开外部脚本引擎的原因。转 MP3 是**可选一步**，找不到 ffmpeg 就只提供 WAV。临时 WAV 放 `mkdtemp()`，
   `finally` 里 `rmtree`；**别放用户选的目录**（中途失败会留下同名垃圾）。
+
+## 搜索（2026-10-19）
+
+- **为什么另开 `app/search.py`**：行号/列号/摘录窗口都是纯判据，可以不起窗口就测；`main.py` 已经五千多行，
+  塞进去会让「界面」和「搜索规则」搅在一起。`main` 反过来不能 import `main` 里的 `first_h1_title`，
+  所以标题解析在 `search.title_of` 里另写了一份（**比它宽松一格：跳过开头空行**——有人习惯先敲个回车）。
+- **列号是字符偏移，不是像素**。行号 1 起、列号 0 起，`f"{line}.{column}"` 直接就是 Tk 索引。`text.splitlines()`
+  天然处理 `\r\n`：**本应用写出的文件在 Windows 上就是 CRLF**（`write_text` 文本模式 + `atomic_write_markdown`
+  原样写回编辑区内容），所以别用 `split("\n")`，否则每行末尾会多一个 `\r`，列号在行尾附近就错位。
+- **搜索条必须 `place`，不能进 grid**。进 grid 等于从编辑区切走一截宽度，「内容行宽」按比例算的排版会整体重排
+  ——开一次搜索正文就跳一次。`place` 之后编辑区宽度不变，`test_the_bar_does_not_change_the_editor_width` 钉住。
+- **条子放顶栏那一行**（`y=px(3)`）：正文第一行往往就是 H1，浮层压上去比「临时盖住专注模式」难受得多。
+- **键事件在隐藏桌面上送不到**：`event_generate("<Control-f>")` 要控件真有键盘焦点，`test_list_editing` 早就踩过。
+  所以测试钉「绑定指向谁」（`bind()` 的脚本文本里有没有 `_on_find_shortcut`）+ 直接调处理函数，不发键事件。
+- **全局范围下别挪光标**：一开始 `_goto_hit` 无脑 `mark_set` + `see()`，结果按一下方向键就把正文滚到另一篇文档的
+  第 3 行——高亮还糊在无关的句子上（截图里「那」字被涂蓝就是它）。现在只有 `hit.path == current_path` 才贴
+  `search_current` / `see()`；`move_cursor` 由调用方显式传（`_open_search_hit` 传 True）。
+- **搜索标签只设 `background`/`foreground`，不设 `elide`**：Tk 的 elide 取「优先级最高且显式设了 elide 的标签」，
+  搜索标签建在最后（优先级最高），一旦顺手设了 `elide=False`，行首记号就再也藏不住了。
+- **正文一改，标签位置全废**：标签按 `行.列` 贴，前面插一个字后面全歪。`_on_editor_modified` 末尾调
+  `_refresh_search_highlights()` 整段重贴（只扫文本，代价约 1ms）。
+- **防抖定时器要真取消**：`_run_search` 里 `self._search_job = None` 只是丢句柄，定时器还挂着；直接调用
+  `_run_search`（打开条子、换范围）时必须 `after_cancel`，否则同一次输入搜两遍。
+- **`⌘` 在长图里是豆腐块**：Microsoft YaHei UI 没有 U+2318，GDI 导出不做字体回退。说明书里**一律写
+  `Command+N`**，别用 ⌘/⇧ 这类符号（`⇧` 同样缺字）。编辑器里也一样——看到方块不是编码坏了。
+
+## 从 MEMORY.md 精简时搬过来的零碎
+
+- **`INCREMENTAL_WINDOW = 48`**：增量重解析只比对光标上下各 48 行；窗口内对不齐（一次粘几十行）就退回整篇。
+- **`tools/` 20 个的清单**在 `.3things/project.md` 的「工具」一节；旧的 62 个探针归档在
+  `outputs/tools-探针归档-2026-09-26.zip`。删探针的判据是「**活文件**（`app/` `tests/` `tools/` 技能
+  `MEMORY.md` 说明书）有没有引用」——历史日志里提到过不算理由。
+- **仓库细节**：分支 `main`，首个提交 `8f63f1e`；`core.autocrlf=false`、`core.quotepath=false`；身份是占位值
+  `JianJi <jianji@localhost>`（仅本仓库）；已忽略 `outputs/`、`.idea/`、`__pycache__/`。
+- **`push_backup.cmd`**：工程根，纯 ASCII + `chcp 65001`，先打印远端/分支/待推提交再 `git push -u origin <分支>`。
+- **`_build_ui()` 的调用顺序**（`_build_window → _build_layout → _apply_typography → _bind_shortcuts`）**不能换**：
+  `_build_layout` 要往 `_build_window` 建出来的控件里放东西，`_apply_typography` 得先拿到那些控件，
+  `_bind_shortcuts` 最后绑。`__init__` 与 `_rebuild_ui` 都走这一串。
+- **`scan_fences()` 整篇与增量共用**；**`build_export_rows` 与卡片摘录里的围栏循环故意没合**。

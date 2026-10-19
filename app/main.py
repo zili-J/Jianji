@@ -14,6 +14,7 @@ from tkinter import filedialog, font, messagebox, simpledialog, ttk
 
 import ffmpeg
 import platform_support
+import search
 import speech
 from image_export import (
     DEFAULT_BODY_SIZE as EXPORT_BODY_SIZE,
@@ -315,6 +316,16 @@ TOP_BAR_HEIGHT = 46
 # 顶栏字数：指针离开顶栏后等这么久再判断「真出去了没有」。
 # 指针在 topbar 与它的子控件之间挪动时 Tk 会发一对 Enter/Leave，不等这一下会闪。
 COUNT_HIDE_DELAY_MS = 60
+
+# ---- 搜索 ----------------------------------------------------------------
+# 搜索条和结果面板都是 `place` 浮在编辑区上的（见 `open_search`），**不进 grid**：
+# 一旦进 grid，编辑区宽度就少一截，「内容行宽」那套按比例算的排版会跟着变——
+# 开一次搜索，正文就整体重排一次，这比挡住几行字难受得多。
+SEARCH_DEBOUNCE_MS = 140          # 敲字到真正开搜之间等这么久（全局搜要读文件）
+SEARCH_RESULTS_WIDTH = 430        # 结果面板宽（逻辑像素），窄窗口下会等比收窄
+SEARCH_RESULTS_MAX_HEIGHT = 420
+SEARCH_RESULTS_MIN_HEIGHT = 96
+SEARCH_TITLE_MAX_CHARS = 26       # 结果行标题最多显示多少字，超了截断
 
 # 编辑区底部的呼吸空间：滚到底时最后一行下面留出这么多（**视口高度的比例**）。
 # 用户要求 25%。写长文时最后一行贴着窗口下沿很难受，光标停在末尾时连「下一行」
@@ -1557,6 +1568,29 @@ class JianJiApp:
         self._doc_delimiter: list[bool] = []
         self._doc_table_rows: dict[int, tuple[TableInfo, int, int]] = {}
 
+        # 搜索。条子与结果面板都是 `place` 出来的（见 `open_search`），不进 grid，
+        # 所以「开着搜索」这件事不影响正文的排版宽度。
+        # `search_scope`：`doc` = 只搜当前文稿，`all` = 搜整个日记文件夹（递归）。
+        self.search_open = False
+        self.search_scope = "doc"
+        self.search_query = ""
+        self.search_hits: list[search.Hit] = []
+        self.search_index = -1
+        self.search_truncated = False
+        self._search_job: str | None = None
+        self.search_bar: tk.Frame | None = None
+        self.search_entry: tk.Entry | None = None
+        self.search_var: tk.StringVar | None = None
+        self.search_status: tk.Label | None = None
+        self.search_scope_buttons: dict[str, tk.Button] = {}
+        self.search_results: tk.Frame | None = None
+        self.search_canvas: tk.Canvas | None = None
+        self.search_inner: tk.Frame | None = None
+        self._search_rows: list[tuple] = []
+        # 全局搜索的文件缓存：路径 → ((mtime_ns, size), 正文)。只为了让「同一个查询
+        # 再敲一个字」不必把几十个文件重读一遍，文件一变键就对不上，自动重读。
+        self._search_text_cache: dict[Path, tuple[tuple[int, int], str]] = {}
+
         self._build_ui()
         self._restore_state()
         self.watch_job = self.root.after(1500, self._watch_external_changes)
@@ -2031,6 +2065,15 @@ class JianJiApp:
         self.editor.tag_configure("syntax_marker", foreground=SYNTAX_COLOR,
                                   elide=False, wrap="char")
 
+        # 搜索命中。**建在最后 = 优先级最高**，所以压在代码块、表格底色、标题色之上
+        # ——不然搜到「代码里的那个词」时，黄色底色会被代码块的灰底盖掉，看不见。
+        # 只设 background / foreground，**不设 elide**：Tk 的 elide 取「优先级最高的
+        # 那个显式设了 elide 的标签」，这里不碰它，行首记号的隐藏与露出就不会被搜索打断。
+        self.editor.tag_configure("search_hit", background=HIGHLIGHT_BG,
+                                  foreground=HIGHLIGHT_TEXT)
+        # 当前这一条：压在强调色上，和其余命中一眼分得开
+        self.editor.tag_configure("search_current", background=ACCENT,
+                                  foreground=ON_ACCENT)
 
     def _bind_shortcuts(self) -> None:
         # 修饰键按平台走（macOS 上 ⌘ + Ctrl 都绑），见 `_shortcut_modifiers`。
@@ -2038,10 +2081,14 @@ class JianJiApp:
             self.root.bind(f"<{prefix}-n>", lambda _event: self.new_document())
             self.root.bind(f"<{prefix}-s>", lambda _event: self.save_now())
             self.root.bind(f"<{prefix}-o>", lambda _event: self.choose_folder())
+            self.root.bind(f"<{prefix}-f>", self._on_find_shortcut)
             self.root.bind(f"<{prefix}-Shift-F>", lambda _event: self.toggle_focus())
             self.editor.bind(f"<{prefix}-b>", self._wrap_bold)
             self.editor.bind(f"<{prefix}-i>", self._wrap_italic)
-        self.root.bind("<Escape>", lambda _event: self._exit_focus())
+            # 编辑区里再绑一次：Tk 的 Text 类绑定里也有一个 `<<Find>>`（映射到
+            # Ctrl+F / ⌘F），控件级先跑，才不会被它抢走。
+            self.editor.bind(f"<{prefix}-f>", self._on_find_shortcut)
+        self.root.bind("<Escape>", self._on_escape)
         # 有序列表的序号续写。绑定在**控件级**（不是 bind_all），
         # 返回 "break" 就吃掉这次回车，不让 Text 的类绑定再插一个换行。
         self.editor.bind("<Return>", self._on_editor_return)
@@ -2139,6 +2186,584 @@ class JianJiApp:
         """
         if self.count_label.winfo_ismapped():
             self._show_counts()
+
+    # ---------- 搜索 ----------
+
+    def toggle_search(self) -> None:
+        """Ctrl+F：开着就关掉，关着就打开。
+
+        用同一个键开与关，是因为打开之后焦点在输入框里，再按一次 Ctrl+F 的人
+        想要的不是「再开一个」，而是「把它收起来」（和大多数编辑器一致）。
+        """
+        if self.search_open:
+            self.close_search()
+        else:
+            self.open_search()
+
+    def open_search(self, scope: str | None = None) -> None:
+        """打开搜索条。
+
+        `scope`：`doc` 只搜当前文稿、`all` 搜整个日记文件夹。第一次打开时按
+        「有没有打开文稿」自动选：**有文稿就搜本文**（Ctrl+F 的默认预期），
+        没有就只能搜全部。
+        """
+        if not self._ensure_search_bar():
+            return
+        if scope is not None:
+            self.search_scope = scope
+        elif not self.search_open:
+            self.search_scope = "doc" if self.current_path is not None else "all"
+        if self.current_path is None:
+            self.search_scope = "all"
+        # 选中的一段文字直接当查询词（和浏览器里按 Ctrl+F 一样）。只在输入框
+        # 空着的时候填，免得把用户上次搜的词覆盖掉。
+        if not self.search_open and not self.search_var.get().strip():
+            picked = self._selected_text_for_search()
+            if picked:
+                self.search_var.set(picked)
+        self.search_open = True
+        self._sync_search_scope()
+        # 条子放在**顶栏那一行**（`TOP_BAR_HEIGHT` 内），不压正文：正文第一行往往
+        # 就是标题，被一条浮层挡住比「暂时盖住顶栏右侧的专注模式」难受得多。
+        # 宽度和结果面板用同一个值，两条边对齐，看起来是一整块。
+        self.search_bar.place(relx=1.0, x=-px(24), y=px(3), anchor="ne",
+                              width=self._search_panel_width())
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, "end")
+        self._run_search()
+
+    def close_search(self) -> None:
+        """收起搜索条，并把正文里的高亮全部摘掉。
+
+        查询词**留着**：下次 Ctrl+F 打开还是上次那句，方便「再找一遍」；
+        但高亮必须清干净——关掉搜索之后正文上还挂着黄色块，会让人以为那是
+        文档的一部分。
+        """
+        if not self.search_open:
+            return
+        self.search_open = False
+        if self._search_job is not None:
+            try:
+                self.root.after_cancel(self._search_job)
+            except tk.TclError:
+                pass
+            self._search_job = None
+        self.search_hits = []
+        self.search_index = -1
+        self.search_truncated = False
+        self._clear_search_highlights()
+        self._hide_search_results()
+        if self.search_bar is not None:
+            self.search_bar.place_forget()
+        if self.editor.winfo_exists():
+            self.editor.focus_set()
+
+    def _on_find_shortcut(self, _event=None) -> str:
+        self.toggle_search()
+        return "break"
+
+    def _on_escape(self, _event=None) -> str | None:
+        """Esc：先关搜索，没搜索才退出专注模式。
+
+        原来 Esc 只管专注模式。搜索条浮在编辑区上时，按 Esc 的人想的是
+        「关掉这个条子」，不是「退出专注」——所以搜索优先。
+        """
+        if self.search_open:
+            self.close_search()
+            return "break"
+        self._exit_focus()
+        return None
+
+    def _selected_text_for_search(self) -> str:
+        """编辑器里选中的一段文字（单行、不太长）——拿来当初始查询词。"""
+        try:
+            if not self.editor.tag_ranges("sel"):
+                return ""
+            text = self.editor.get("sel.first", "sel.last")
+        except tk.TclError:
+            return ""
+        text = text.strip()
+        if not text or "\n" in text or len(text) > 60:
+            return ""
+        return text
+
+    def _ensure_search_bar(self) -> bool:
+        """第一次用到时再建搜索条；换主题整块重建之后这里会再建一份。"""
+        if self.search_bar is not None and self.search_bar.winfo_exists():
+            return True
+        try:
+            self._build_search_bar()
+        except tk.TclError:
+            return False
+        return True
+
+    def _build_search_bar(self) -> None:
+        bar = tk.Frame(self.editor_panel, bg=CARD_BG, highlightthickness=1,
+                       highlightbackground=BORDER, highlightcolor=BORDER)
+        self.search_bar = bar
+        self.search_var = tk.StringVar(master=self.root, value=self.search_query)
+        self.search_var.trace_add("write", self._on_search_query_changed)
+
+        entry = tk.Entry(
+            bar, textvariable=self.search_var, bg=CARD_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", borderwidth=0,
+            highlightthickness=0, font=(FAMILY, 10), width=22,
+        )
+        entry.grid(row=0, column=0, sticky="ew", padx=(px(12), px(6)), pady=px(7))
+        bar.grid_columnconfigure(0, weight=1)
+        self.search_entry = entry
+
+        for column, (key, label) in enumerate((("doc", "本文"), ("all", "全部")),
+                                              start=1):
+            button = tk.Button(
+                bar, text=label, command=lambda k=key: self.set_search_scope(k),
+                bg=CARD_BG, fg=MUTED, activebackground=SURFACE,
+                activeforeground=ACCENT, relief="flat", borderwidth=0,
+                padx=px(7), pady=px(3), cursor="hand2", font=(FAMILY, 9),
+            )
+            button.grid(row=0, column=column, sticky="e", padx=(0, px(2)), pady=px(5))
+            self.search_scope_buttons[key] = button
+
+        self.search_status = tk.Label(bar, text="", bg=CARD_BG, fg=MUTED,
+                                      font=(FAMILY, 9), width=11, anchor="e")
+        self.search_status.grid(row=0, column=3, sticky="e", padx=(px(4), px(2)))
+
+        for column, (text, command) in enumerate(
+                (("↑", lambda: self._search_step(-1)),
+                 ("↓", lambda: self._search_step(1))), start=4):
+            tk.Button(
+                bar, text=text, command=command, bg=CARD_BG, fg=MUTED,
+                activebackground=SURFACE, activeforeground=ACCENT, relief="flat",
+                borderwidth=0, padx=px(6), pady=px(2), cursor="hand2",
+                font=(FAMILY, 10),
+            ).grid(row=0, column=column, sticky="e", pady=px(5))
+        tk.Button(
+            bar, text="×", command=self.close_search, bg=CARD_BG, fg=MUTED,
+            activebackground=SURFACE, activeforeground=TEXT, relief="flat",
+            borderwidth=0, padx=px(8), pady=px(2), cursor="hand2",
+            font=(FAMILY, 12),
+        ).grid(row=0, column=6, sticky="e", padx=(0, px(4)), pady=px(5))
+
+        # 回车 = 下一条（全部范围下是「打开选中的那条」）；上下键翻条；
+        # Esc 关条；再按 Ctrl+F 全选输入框里的词。**每个都返回 "break"**：
+        # 不返回的话 Esc 会继续冒泡到根窗口，把专注模式一起退掉。
+        entry.bind("<Return>", self._on_search_enter)
+        entry.bind("<KP_Enter>", self._on_search_enter)
+        entry.bind("<Shift-Return>", lambda _event: self._search_step(-1))
+        entry.bind("<Down>", lambda _event: self._search_step(1))
+        entry.bind("<Up>", lambda _event: self._search_step(-1))
+        entry.bind("<Escape>", lambda _event: self._search_escape())
+        # 已经在搜索条里再按一次 Ctrl+F（macOS 上 ⌘F 也认）：全选输入框里的词，
+        # 直接打字就替换掉。主键同样走 `_shortcut_modifiers()`，不写死。
+        for prefix in _shortcut_modifiers():
+            entry.bind(f"<{prefix}-f>", lambda _event: self._select_search_text())
+
+    def _select_search_text(self) -> str:
+        if self.search_entry is not None:
+            self.search_entry.select_range(0, "end")
+        return "break"
+
+    def _search_escape(self) -> str:
+        self.close_search()
+        return "break"
+
+    def _on_search_enter(self, _event=None) -> str:
+        if self.search_scope == "all":
+            self._open_search_hit(self.search_index)
+        else:
+            self._search_step(1)
+        return "break"
+
+    def _on_search_query_changed(self, *_args) -> None:
+        """输入框内容变了：等一小会儿再搜。
+
+        全局搜索要读几十个文件，每敲一个字就同步跑一遍会让输入卡顿；等
+        `SEARCH_DEBOUNCE_MS` 之后只搜最后一次的内容。
+        """
+        if not self.search_open:
+            return
+        if self._search_job is not None:
+            try:
+                self.root.after_cancel(self._search_job)
+            except tk.TclError:
+                pass
+        self._search_job = self.root.after(SEARCH_DEBOUNCE_MS, self._run_search)
+
+    def set_search_scope(self, scope: str) -> None:
+        """在「本文 / 全部」之间切换，保留查询词并立刻重搜。"""
+        if scope not in ("doc", "all"):
+            return
+        if scope == "doc" and self.current_path is None:
+            return                       # 没有打开的文稿，「本文」没有意义
+        if self.search_scope != scope:
+            self.search_scope = scope
+            self._sync_search_scope()
+            self._run_search()
+        if self.search_entry is not None:
+            self.search_entry.focus_set()
+
+    def _sync_search_scope(self) -> None:
+        """两个范围按钮的选中态；没打开文稿时「本文」变灰不可点。"""
+        has_doc = self.current_path is not None
+        for key, button in self.search_scope_buttons.items():
+            active = key == self.search_scope
+            enabled = has_doc or key == "all"
+            button.configure(
+                bg=SURFACE if active else CARD_BG,
+                fg=(ACCENT if active else MUTED) if enabled else BORDER,
+                state="normal" if enabled else "disabled",
+                disabledforeground=BORDER,
+            )
+
+    def _run_search(self) -> None:
+        """按当前查询词和范围重算一遍结果。"""
+        # 可能是防抖定时器叫起来的，也可能是直接调的（打开搜索条、换范围）。
+        # 不管哪种，先把还挂着的那次取消掉，免得同一次输入搜两遍。
+        if self._search_job is not None:
+            try:
+                self.root.after_cancel(self._search_job)
+            except tk.TclError:
+                pass
+            self._search_job = None
+        if not self.search_open or self.search_var is None:
+            return
+        query = search.normalize(self.search_var.get())
+        self.search_query = query
+        if not query:
+            self.search_hits = []
+            self.search_index = -1
+            self.search_truncated = False
+            self._clear_search_highlights()
+            self._hide_search_results()
+            self._update_search_status()
+            return
+
+        if self.search_scope == "doc" and self.current_path is not None:
+            hits = search.find_in_text(
+                self.editor.get("1.0", "end-1c"), query,
+                path=self.current_path, limit=search.MAX_RESULTS)
+            self.search_hits = hits
+            self.search_index = 0 if hits else -1
+            self.search_truncated = len(hits) >= search.MAX_RESULTS
+            self._hide_search_results()
+            self._apply_search_highlights(hits)
+            if hits:
+                self._goto_hit(0)
+            self._update_search_status()
+            return
+
+        self.search_scope = "all"
+        hits, truncated = self._search_all_documents(query)
+        self.search_hits = hits
+        self.search_index = 0 if hits else -1
+        self.search_truncated = truncated
+        self._clear_search_highlights()
+        self._show_search_results(hits, truncated)
+        self._sync_search_scope()
+        self._update_search_status()
+
+    def _search_all_documents(self, query: str) -> tuple[list[search.Hit], bool]:
+        """在日记文件夹里递归搜（跳过 `.简记回收站`，走的是和列表同一个入口）。"""
+        if self.folder is None:
+            return [], False
+        paths = list_markdown(self.folder, recursive=True, sort_key="modified")
+        return search.search_files(paths, query, read=self._read_search_text)
+
+    def _read_search_text(self, path: Path) -> str | None:
+        """读一篇文档的正文，带缓存；当前打开且有未保存改动的那篇用编辑区里的字。
+
+        缓存键是 `(mtime_ns, size)`：文件一变键就对不上，自动重读，不会拿到旧内容。
+        当前文稿走编辑区，是因为它可能还没落盘（自动保存有 700ms 延迟），
+        搜磁盘版本会漏掉刚敲的字。
+        """
+        if path == self.current_path and self.dirty:
+            return self.editor.get("1.0", "end-1c")
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._search_text_cache.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            return None
+        if len(self._search_text_cache) > 600:
+            self._search_text_cache.clear()
+        self._search_text_cache[path] = (key, text)
+        return text
+
+    def _apply_search_highlights(self, hits: list[search.Hit]) -> None:
+        self._clear_search_highlights()
+        for hit in hits:
+            try:
+                self.editor.tag_add("search_hit", f"{hit.line}.{hit.column}",
+                                    f"{hit.line}.{hit.column + hit.length}")
+            except tk.TclError:
+                continue
+        self.editor.tag_raise("search_hit")
+
+    def _clear_search_highlights(self) -> None:
+        for tag in ("search_hit", "search_current"):
+            try:
+                self.editor.tag_remove(tag, "1.0", "end")
+            except tk.TclError:
+                pass
+
+    def _refresh_search_highlights(self) -> None:
+        """正文改过之后重算命中位置。
+
+        标签是按 `行.列` 贴的，一个字插进来后面全部错位——所以每次改动都重贴。
+        只扫一遍文本，不开窗、不排版，代价很小。
+        """
+        if not self.search_open or self.search_scope != "doc" or self.search_var is None:
+            return
+        query = search.normalize(self.search_var.get())
+        if not query:
+            return
+        hits = search.find_in_text(self.editor.get("1.0", "end-1c"), query,
+                                   path=self.current_path, limit=search.MAX_RESULTS)
+        self.search_hits = hits
+        self.search_truncated = len(hits) >= search.MAX_RESULTS
+        if not hits:
+            self.search_index = -1
+        else:
+            self.search_index = max(0, min(self.search_index, len(hits) - 1))
+        self._apply_search_highlights(hits)
+        if hits:
+            hit = hits[self.search_index]
+            try:
+                self.editor.tag_add("search_current",
+                                    f"{hit.line}.{hit.column}",
+                                    f"{hit.line}.{hit.column + hit.length}")
+                self.editor.tag_raise("search_current")
+            except tk.TclError:
+                pass
+        self._update_search_status()
+
+    def _goto_hit(self, index: int, *, move_cursor: bool | None = None) -> None:
+        """跳到第 `index` 条命中（越界自动绕回来）。
+
+        `move_cursor` 不传时按范围决定：**本文范围挪光标，全局范围不挪**。
+        全局范围下方向键只是在结果列表里换选中项，一挪光标就等于把正在看的那篇
+        文档换掉了；真正要打开时才由 `_open_search_hit` 显式传 True。
+        """
+        if not self.search_hits:
+            return
+        index %= len(self.search_hits)
+        hit = self.search_hits[index]
+        if move_cursor is None:
+            move_cursor = self.search_scope == "doc"
+        self.search_index = index
+        # 全局范围下选中的那条可能根本不在**当前打开的这篇**里。那种情况下
+        # 「行.列」是另一篇文档的坐标，照着贴会把高亮糊在无关的句子上、
+        # `see()` 还会把正文滚到一个毫不相干的位置——只在同一篇里才落地。
+        same_document = hit.path is None or hit.path == self.current_path
+        try:
+            self.editor.tag_remove("search_current", "1.0", "end")
+            if same_document:
+                start = f"{hit.line}.{hit.column}"
+                end = f"{hit.line}.{hit.column + hit.length}"
+                self.editor.tag_add("search_current", start, end)
+                self.editor.tag_raise("search_current")
+                if move_cursor:
+                    self.editor.mark_set("insert", start)
+                    self._refresh_cursor_line()
+                self.editor.see(start)
+        except tk.TclError:
+            pass
+        if self.search_scope == "all":
+            self._paint_search_selection()
+            self._scroll_results_to(index)
+        self._update_search_status()
+
+    def _search_step(self, delta: int) -> str:
+        if self.search_hits:
+            self._goto_hit(self.search_index + delta)
+        return "break"
+
+    def _open_search_hit(self, index: int) -> None:
+        """打开某条全局结果：切到那篇文稿，把光标放到命中处。"""
+        if not (0 <= index < len(self.search_hits)):
+            return
+        hit = self.search_hits[index]
+        if hit.path is None:
+            return
+        if hit.path != self.current_path:
+            self.open_file(hit.path)
+            if self.current_path != hit.path:
+                return                   # 文件被删 / 读不了，`open_file` 已经报过错
+        # 这里必须显式挪光标：全局范围下方向键只换选中项，回车才是「真的过去」
+        self._goto_hit(index, move_cursor=True)
+        self.editor.focus_set()
+
+    def _update_search_status(self) -> None:
+        if self.search_status is None or not self.search_open:
+            return
+        if not self.search_query:
+            text = ""
+        elif not self.search_hits:
+            text = "无结果"
+        elif self.search_scope == "doc":
+            text = f"{self.search_index + 1}/{len(self.search_hits)}"
+        else:
+            files = len({hit.path for hit in self.search_hits})
+            text = f"{files} 篇 {len(self.search_hits)} 处"
+        if text and self.search_truncated:
+            text += "+"
+        self.search_status.configure(text=text)
+
+    # ---------- 搜索结果面板 ----------
+
+    def _search_panel_width(self) -> int:
+        available = self.editor_panel.winfo_width()
+        limit = available - px(40) if available > 1 else px(SEARCH_RESULTS_WIDTH)
+        return max(px(260), min(px(SEARCH_RESULTS_WIDTH), limit))
+
+    def _ensure_results_panel(self) -> None:
+        if self.search_results is not None and self.search_results.winfo_exists():
+            return
+        panel = tk.Frame(self.editor_panel, bg=CARD_BG, highlightthickness=1,
+                         highlightbackground=BORDER, highlightcolor=BORDER)
+        canvas = tk.Canvas(panel, bg=CARD_BG, highlightthickness=0, borderwidth=0)
+        canvas.pack(fill="both", expand=True, padx=px(2), pady=px(2))
+        inner = tk.Frame(canvas, bg=CARD_BG)
+        window = canvas.create_window((0, 0), anchor="nw", window=inner)
+        canvas.bind("<Configure>",
+                    lambda event: canvas.itemconfigure(window, width=event.width))
+        inner.bind("<Configure>",
+                   lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<MouseWheel>", self._on_search_results_wheel)
+        inner.bind("<MouseWheel>", self._on_search_results_wheel)
+        self.search_results = panel
+        self.search_canvas = canvas
+        self.search_inner = inner
+
+    def _show_search_results(self, hits: list[search.Hit], truncated: bool) -> None:
+        self._ensure_results_panel()
+        if self.search_results is None or self.search_inner is None:
+            return
+        for child in self.search_inner.winfo_children():
+            child.destroy()
+        self._search_rows = []
+        width = self._search_panel_width()
+
+        if not hits:
+            tk.Label(self.search_inner, text="没有找到", bg=CARD_BG, fg=MUTED,
+                     font=(FAMILY, 9), anchor="w", padx=px(14),
+                     pady=px(14)).pack(fill="x")
+        else:
+            for order, hit in enumerate(hits):
+                self._search_rows.append(self._build_result_row(order, hit, width))
+
+        self.search_results.place(relx=1.0, x=-px(24), y=px(TOP_BAR_HEIGHT + 4),
+                                  anchor="ne", width=width,
+                                  height=self._results_height())
+        self._paint_search_selection()
+        if self.search_canvas is not None:
+            self.search_canvas.yview_moveto(0)
+
+    def _results_height(self) -> int:
+        """结果面板的高度：按内容来，封顶 `SEARCH_RESULTS_MAX_HEIGHT`。
+
+        固定高度会让「只搜到一条」时下面拖着一大块空白，看着像没加载完。
+        """
+        available = self.editor_panel.winfo_height() - px(TOP_BAR_HEIGHT + 20)
+        ceiling = max(px(SEARCH_RESULTS_MIN_HEIGHT),
+                      min(px(SEARCH_RESULTS_MAX_HEIGHT), available))
+        if self.search_inner is None:
+            return ceiling
+        self.search_inner.update_idletasks()
+        needed = self.search_inner.winfo_reqheight() + px(6)
+        return max(px(SEARCH_RESULTS_MIN_HEIGHT), min(ceiling, needed))
+
+    def _build_result_row(self, order: int, hit: search.Hit, width: int) -> tuple:
+        row = tk.Frame(self.search_inner, bg=CARD_BG, cursor="hand2")
+        row.pack(fill="x", padx=px(4), pady=(px(1), px(1)))
+        row.grid_columnconfigure(0, weight=1)
+
+        title = tk.Label(row, text=self._short_title(hit.title), bg=CARD_BG, fg=TEXT,
+                         font=(FAMILY, 9, "bold"), anchor="w")
+        title.grid(row=0, column=0, sticky="w", padx=(px(8), px(4)), pady=(px(6), 0))
+        meta = tk.Label(row, text=f"第 {hit.line} 行", bg=CARD_BG, fg=MUTED,
+                        font=(FAMILY, 8), anchor="e")
+        meta.grid(row=0, column=1, sticky="e", padx=(0, px(8)), pady=(px(6), 0))
+        snippet = tk.Label(row, text=hit.snippet, bg=CARD_BG, fg=MUTED,
+                           font=(FAMILY, 9), anchor="w", justify="left",
+                           wraplength=max(px(180), width - px(34)))
+        snippet.grid(row=1, column=0, columnspan=2, sticky="w",
+                     padx=(px(8), px(8)), pady=(0, px(6)))
+
+        for widget in (row, title, meta, snippet):
+            widget.bind("<Button-1>", lambda _event, i=order: self._open_search_hit(i))
+            widget.bind("<Enter>", lambda _event, i=order: self._hover_result(i, True))
+            widget.bind("<Leave>", lambda _event, i=order: self._hover_result(i, False))
+            widget.bind("<MouseWheel>", self._on_search_results_wheel)
+        return (row, title, meta, snippet)
+
+    def _short_title(self, title: str) -> str:
+        if len(title) <= SEARCH_TITLE_MAX_CHARS:
+            return title
+        return title[:SEARCH_TITLE_MAX_CHARS] + "…"
+
+    def _hover_result(self, index: int, inside: bool) -> None:
+        if not (0 <= index < len(self._search_rows)) or index == self.search_index:
+            return
+        bg = SURFACE_HOVER if inside else CARD_BG
+        for widget in self._search_rows[index]:
+            try:
+                widget.configure(bg=bg)
+            except tk.TclError:
+                pass
+
+    def _paint_search_selection(self) -> None:
+        for index, widgets in enumerate(self._search_rows):
+            bg = SELECTION_BG if index == self.search_index else CARD_BG
+            for widget in widgets:
+                try:
+                    widget.configure(bg=bg)
+                except tk.TclError:
+                    pass
+
+    def _scroll_results_to(self, index: int) -> None:
+        if not (0 <= index < len(self._search_rows)) or self.search_canvas is None:
+            return
+        if self.search_inner is None:
+            return
+        row = self._search_rows[index][0]
+        canvas = self.search_canvas
+        canvas.update_idletasks()
+        total = self.search_inner.winfo_height()
+        if total <= 1:
+            return
+        top = row.winfo_y()
+        bottom = top + row.winfo_height()
+        view_top = canvas.canvasy(0)
+        view_height = canvas.winfo_height()
+        if top < view_top:
+            canvas.yview_moveto(top / total)
+        elif bottom > view_top + view_height:
+            canvas.yview_moveto(max(0.0, (bottom - view_height) / total))
+
+    def _on_search_results_wheel(self, event) -> str:
+        if self.search_canvas is not None:
+            self.search_canvas.yview_scroll(
+                -LIST_WHEEL_UNITS if event.delta > 0 else LIST_WHEEL_UNITS, "units")
+        return "break"
+
+    def _hide_search_results(self) -> None:
+        if self.search_results is not None:
+            try:
+                self.search_results.place_forget()
+            except tk.TclError:
+                pass
+
+    def _refresh_search_after_open(self) -> None:
+        """换了一篇文稿：本文范围要按新正文重算，全局范围不用动（结果还在）。"""
+        if self.search_open and self.search_scope == "doc":
+            self._run_search()
 
     # ---------- 导出长图 ----------
 
@@ -4218,6 +4843,8 @@ class JianJiApp:
         # 不能只靠 `<<Modified>>`：上面刚 `edit_modified(False)` 清掉了标志，
         # 那个事件回来时第一道判据就不成立。这里也必须 force。
         self._apply_bottom_pad(force=True)
+        # 搜索条开着且是「本文」范围的话，按新正文重算一遍命中
+        self._refresh_search_after_open()
         self.editor.focus_set()
         # 换了文稿，顶栏那句的创建/修改时间要跟着换（指针停在顶栏上时用快捷键
         # 切文稿的情形；从文稿列表点进来时指针在列表那边，标签本来就收着）。
@@ -4242,6 +4869,9 @@ class JianJiApp:
         # 一次粘进来太多行）才退回整篇重解析。
         if not self._apply_markdown_styles_incremental():
             self._apply_markdown_styles()
+        # 正文变了，搜索命中的位置全部要重贴（标签按 行.列 定位，一个字插进来
+        # 后面就错位了）。搜索条没开时这一步什么都不做。
+        self._refresh_search_highlights()
         if self.save_job:
             self.root.after_cancel(self.save_job)
         self.save_job = self.root.after(700, self.save_now)
@@ -5398,6 +6028,16 @@ class JianJiApp:
         cursor = self.editor.index("insert") if has_document else "1.0"
         scroll = self.editor.yview()[0] if has_document else 0.0
 
+        # 搜索条也是按旧配色建的，重建后要按原来的范围与查询词再开一次
+        was_searching = self.search_open
+        search_scope = self.search_scope
+        if self._search_job is not None:
+            try:
+                self.root.after_cancel(self._search_job)
+            except tk.TclError:
+                pass
+            self._search_job = None
+
         # 待触发的那次「隐藏字数」还攥着旧 `count_label`，重建后它就是个死控件
         if self._counts_job is not None:
             try:
@@ -5421,7 +6061,7 @@ class JianJiApp:
         # 序列列表由 `_shortcut_modifiers()` 推出来——和 `_bind_shortcuts` 同一份，
         # 手抄一遍就会在 macOS 上漏掉 Command 那一组，留下叠绑。
         for prefix in _shortcut_modifiers():
-            for key in ("n", "s", "o", "Shift-F"):
+            for key in ("n", "s", "o", "Shift-F", "f"):
                 self.root.unbind(f"<{prefix}-{key}>")
         for sequence in ("<Escape>", "<Destroy>"):
             self.root.unbind(sequence)
@@ -5443,6 +6083,18 @@ class JianJiApp:
         self._margin_signature = None
         self._gutter_pending = False
         self._geometry_pending = False
+        # 搜索条 / 结果面板都是 place 出来的子控件，已经随上面一起销毁了。
+        # 引用留着就是死控件，清掉让 `_ensure_search_bar` 重建一份。
+        self.search_bar = None
+        self.search_entry = None
+        self.search_var = None
+        self.search_status = None
+        self.search_scope_buttons = {}
+        self.search_results = None
+        self.search_canvas = None
+        self.search_inner = None
+        self._search_rows = []
+        self._search_text_cache = {}
 
         self._build_ui()
 
@@ -5463,6 +6115,11 @@ class JianJiApp:
             self._apply_markdown_styles()
             self.editor.yview_moveto(scroll)
             self.editor.focus_set()
+
+        # 搜索条按原来的范围和查询词重新打开：查询词在 `search_query` 里，
+        # 新建的输入框会拿它当初值（见 `_build_search_bar`）。
+        if was_searching:
+            self.open_search(search_scope)
 
     # ---------- 设置窗口 ----------
 
